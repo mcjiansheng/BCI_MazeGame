@@ -24,3 +24,15 @@ Maze-game/[Mm]emoryCaptures/
 
 # Generated experiment checkpoints, including ablation runs.
 outputs/ablations/checkpoints/
+
+# Personal papers, presentations, defense materials, and reference papers.
+doc/**/*.pdf
+doc/**/*.doc
+doc/**/*.docx
+doc/**/*.ppt
+doc/**/*.pptx
+doc/**/*论文*.md
+doc/**/*演讲*.md
+doc/**/*答辩*.md
+doc/**/*中期考核*.md
+doc/参考论文/

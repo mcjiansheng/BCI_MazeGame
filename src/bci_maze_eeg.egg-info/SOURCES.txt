@@ -1,0 +1,16 @@
+pyproject.toml
+src/bci_maze/__init__.py
+src/bci_maze/preprocessing.py
+src/bci_maze/training.py
+src/bci_maze/models/__init__.py
+src/bci_maze/models/eeg_conformer.py
+src/bci_maze/models/fbcnet.py
+src/bci_maze/models/layers.py
+src/bci_maze/models/se_mhaf_conformer.py
+src/bci_maze_eeg.egg-info/PKG-INFO
+src/bci_maze_eeg.egg-info/SOURCES.txt
+src/bci_maze_eeg.egg-info/dependency_links.txt
+src/bci_maze_eeg.egg-info/requires.txt
+src/bci_maze_eeg.egg-info/top_level.txt
+tests/test_models.py
+tests/test_preprocessing.py

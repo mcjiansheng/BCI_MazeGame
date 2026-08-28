@@ -1,0 +1,26 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+data/processed/
+outputs/checkpoints/
+outputs/*.json
+outputs/*.csv
+tmp/
+
+# Local EEG datasets; download separately as described in the documentation.
+data/BCIC2a/*.gdf
+data/BCIC2b/*.mat
+
+# Unity generated files and local editor state.
+Maze-game/[Ll]ibrary/
+Maze-game/[Tt]emp/
+Maze-game/[Oo]bj/
+Maze-game/[Bb]uild/
+Maze-game/[Bb]uilds/
+Maze-game/[Ll]ogs/
+Maze-game/[Uu]ser[Ss]ettings/
+Maze-game/[Mm]emoryCaptures/
+
+# Generated experiment checkpoints, including ablation runs.
+outputs/ablations/checkpoints/

@@ -1,0 +1,104 @@
+{
+  "configs_by_model": {
+    "se_mhaf_conformer_final": {
+      "dataset_name": "bcic2a",
+      "file_prefix": "A",
+      "processed_dir": "data/processed/bcic2a",
+      "output_dir": "outputs\\ablations",
+      "epochs": 300,
+      "patience": 80,
+      "batch_size": 64,
+      "learning_rate": 0.001,
+      "weight_decay": 0.0,
+      "validation_size": 0.2,
+      "seed": 42,
+      "exclude_artifacts": true,
+      "augment": true,
+      "amp": true,
+      "num_workers": 0
+    }
+  },
+  "results": [
+    {
+      "model": "se_mhaf_conformer_final",
+      "dataset": "bcic2a",
+      "subject": 1,
+      "n_channels": 22,
+      "n_classes": 4,
+      "parameter_count": 482482,
+      "trainable_parameter_count": 470670,
+      "train_trials": 218,
+      "validation_trials": 55,
+      "best_epoch": 0,
+      "epochs_ran": 80,
+      "baseline_validation_accuracy": 0.8727272727272727,
+      "validation_accuracy": 0.8727272727272727,
+      "accuracy": 0.7793594306049823,
+      "macro_f1": 0.7798173879040666,
+      "kappa": 0.7060024637607789,
+      "confusion_matrix": [
+        [
+          59,
+          6,
+          5,
+          1
+        ],
+        [
+          9,
+          60,
+          1,
+          0
+        ],
+        [
+          1,
+          1,
+          57,
+          10
+        ],
+        [
+          0,
+          0,
+          28,
+          43
+        ]
+      ],
+      "n_trials": 281,
+      "excluded_train_artifacts": 15,
+      "excluded_test_artifacts": 7,
+      "duration_seconds": 36.53590550000081,
+      "peak_gpu_memory_mb": 713.962890625,
+      "checkpoint_size_bytes": 1984358,
+      "checkpoint": "outputs\\ablations\\checkpoints\\bcic2a\\se_mhaf_conformer_final\\A01.pt",
+      "backbone_checkpoint": "outputs\\checkpoints\\fbcnet\\A01.pt",
+      "temporal_expert_checkpoint": "outputs\\checkpoints\\bcic2a\\se_mhaf_conformer_v2\\A01.pt",
+      "transferred_temporal_weights": 98,
+      "min_validation_gain": 0.05,
+      "training_config": {
+        "dataset_name": "bcic2a",
+        "file_prefix": "A",
+        "processed_dir": "data/processed/bcic2a",
+        "output_dir": "outputs\\ablations",
+        "epochs": 300,
+        "patience": 80,
+        "batch_size": 64,
+        "learning_rate": 0.001,
+        "weight_decay": 0.0,
+        "validation_size": 0.2,
+        "seed": 42,
+        "exclude_artifacts": true,
+        "augment": true,
+        "amp": true,
+        "num_workers": 0
+      }
+    }
+  ],
+  "summary": {
+    "se_mhaf_conformer_final": {
+      "mean_accuracy": 0.7793594306049823,
+      "std_accuracy": 0.0,
+      "mean_macro_f1": 0.7798173879040666,
+      "mean_kappa": 0.7060024637607789,
+      "subjects": 1
+    }
+  }
+}

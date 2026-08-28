@@ -1,0 +1,88 @@
+{
+  "configs_by_model": {
+    "se_mhaf_conformer_final": {
+      "dataset_name": "bcic2b",
+      "file_prefix": "B",
+      "processed_dir": "data/processed/bcic2b",
+      "output_dir": "outputs\\ablations",
+      "epochs": 250,
+      "patience": 80,
+      "batch_size": 64,
+      "learning_rate": 0.001,
+      "weight_decay": 0.0,
+      "validation_size": 0.2,
+      "seed": 42,
+      "exclude_artifacts": true,
+      "augment": true,
+      "amp": true,
+      "num_workers": 0
+    }
+  },
+  "results": [
+    {
+      "model": "se_mhaf_conformer_final",
+      "dataset": "bcic2b",
+      "subject": 1,
+      "n_channels": 3,
+      "n_classes": 2,
+      "parameter_count": 473434,
+      "trainable_parameter_count": 469400,
+      "train_trials": 259,
+      "validation_trials": 65,
+      "best_epoch": 88,
+      "epochs_ran": 168,
+      "baseline_validation_accuracy": 0.7538461538461538,
+      "validation_accuracy": 0.9230769230769231,
+      "accuracy": 0.7675438596491229,
+      "macro_f1": 0.7675393878768059,
+      "kappa": 0.5358020897357099,
+      "confusion_matrix": [
+        [
+          87,
+          22
+        ],
+        [
+          31,
+          88
+        ]
+      ],
+      "n_trials": 228,
+      "excluded_train_artifacts": 76,
+      "excluded_test_artifacts": 92,
+      "duration_seconds": 33.568649099999675,
+      "peak_gpu_memory_mb": 384.6455078125,
+      "checkpoint_size_bytes": 1948198,
+      "checkpoint": "outputs\\ablations\\checkpoints\\bcic2b\\se_mhaf_conformer_final\\B01.pt",
+      "backbone_checkpoint": "outputs\\checkpoints\\bcic2b\\fbcnet\\B01.pt",
+      "temporal_expert_checkpoint": "outputs\\checkpoints\\bcic2b\\se_mhaf_conformer_v2\\B01.pt",
+      "transferred_temporal_weights": 98,
+      "min_validation_gain": 0.05,
+      "training_config": {
+        "dataset_name": "bcic2b",
+        "file_prefix": "B",
+        "processed_dir": "data/processed/bcic2b",
+        "output_dir": "outputs\\ablations",
+        "epochs": 250,
+        "patience": 80,
+        "batch_size": 64,
+        "learning_rate": 0.001,
+        "weight_decay": 0.0,
+        "validation_size": 0.2,
+        "seed": 42,
+        "exclude_artifacts": true,
+        "augment": true,
+        "amp": true,
+        "num_workers": 0
+      }
+    }
+  ],
+  "summary": {
+    "se_mhaf_conformer_final": {
+      "mean_accuracy": 0.7675438596491229,
+      "std_accuracy": 0.0,
+      "mean_macro_f1": 0.7675393878768059,
+      "mean_kappa": 0.5358020897357099,
+      "subjects": 1
+    }
+  }
+}

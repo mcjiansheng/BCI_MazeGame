@@ -2,6 +2,8 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.idea/
+.qoder/
 data/processed/
 data/recordings/
 outputs/checkpoints/
@@ -28,6 +30,9 @@ Maze-game/[Mm]emoryCaptures/
 # Generated experiment checkpoints, including ablation runs.
 outputs/ablations/checkpoints/
 
+# Exported deployment artifacts (TorchScript/ONNX).
+outputs/exports/
+
 # Personal papers, presentations, defense materials, and reference papers.
 doc/**/*.pdf
 doc/**/*.doc
@@ -38,4 +43,5 @@ doc/**/*论文*.md
 doc/**/*演讲*.md
 doc/**/*答辩*.md
 doc/**/*中期考核*.md
+doc/Box资料阅读与项目参考分析.md
 doc/参考论文/

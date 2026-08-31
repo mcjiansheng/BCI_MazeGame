@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import random
+import subprocess
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -72,20 +73,66 @@ def seed_everything(seed: int) -> None:
     torch.backends.cudnn.benchmark = False
 
 
+def repo_revision() -> str:
+    """Best-effort git commit hash for result provenance; never raises."""
+    try:
+        completed = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            cwd=Path(__file__).resolve().parents[2],
+        )
+        if completed.returncode == 0 and completed.stdout.strip():
+            return completed.stdout.strip()
+    except Exception:  # noqa: BLE001
+        pass
+    return "unknown"
+
+
 def _normalize_broadband(
     train_x: np.ndarray, test_x: np.ndarray, fit_indices: np.ndarray
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, dict[str, object]]:
     mean = train_x[fit_indices].mean(axis=(0, 2), keepdims=True)
     std = train_x[fit_indices].std(axis=(0, 2), keepdims=True).clip(min=1e-6)
-    return ((train_x - mean) / std).astype(np.float32), ((test_x - mean) / std).astype(np.float32)
+    stats = {
+        "mode": "broadband",
+        "mean": mean,
+        "std": std,
+        "fit_trials": int(fit_indices.size),
+    }
+    return ((train_x - mean) / std).astype(np.float32), ((test_x - mean) / std).astype(np.float32), stats
 
 
 def _normalize_filter_bank(
     train_x: np.ndarray, test_x: np.ndarray, fit_indices: np.ndarray
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, dict[str, object]]:
     mean = train_x[fit_indices].mean(axis=(0, 3), keepdims=True)
     std = train_x[fit_indices].std(axis=(0, 3), keepdims=True).clip(min=1e-6)
-    return ((train_x - mean) / std).astype(np.float32), ((test_x - mean) / std).astype(np.float32)
+    stats = {
+        "mode": "filter_bank",
+        "mean": mean,
+        "std": std,
+        "fit_trials": int(fit_indices.size),
+    }
+    return ((train_x - mean) / std).astype(np.float32), ((test_x - mean) / std).astype(np.float32), stats
+
+
+def norm_stats_to_serializable(stats: dict[str, object]) -> dict[str, object]:
+    """Convert numpy normalization statistics into a JSON/torch-save friendly dict."""
+    return {
+        "mode": stats["mode"],
+        "mean": np.asarray(stats["mean"]).tolist(),
+        "std": np.asarray(stats["std"]).tolist(),
+        "fit_trials": stats["fit_trials"],
+    }
+
+
+def apply_norm_stats(x: np.ndarray, stats: dict[str, object]) -> np.ndarray:
+    """Apply frozen normalization statistics (e.g. at inference time)."""
+    mean = np.asarray(stats["mean"], dtype=np.float32)
+    std = np.asarray(stats["std"], dtype=np.float32).clip(min=1e-6)
+    return ((x - mean) / std).astype(np.float32)
 
 
 def prepare_subject_data(
@@ -96,7 +143,8 @@ def prepare_subject_data(
     seed: int,
     exclude_artifacts: bool,
     file_prefix: str = "A",
-) -> dict[str, np.ndarray]:
+    keep_raw: bool = False,
+) -> dict[str, object]:
     training = load_processed_session(processed_dir, subject, "T", file_prefix=file_prefix)
     evaluation = load_processed_session(processed_dir, subject, "E", file_prefix=file_prefix)
     train_keep = ~training["artifact"] if exclude_artifacts else np.ones_like(training["artifact"], bool)
@@ -123,21 +171,32 @@ def prepare_subject_data(
     if uses_filter_bank(model_name):
         train_x = make_filter_bank(train_x)
         test_x = make_filter_bank(test_x)
-        train_x, test_x = _normalize_filter_bank(train_x, test_x, train_indices)
+        train_x, test_x, norm_stats = _normalize_filter_bank(train_x, test_x, train_indices)
     else:
-        train_x, test_x = _normalize_broadband(train_x, test_x, train_indices)
+        train_x, test_x, norm_stats = _normalize_broadband(train_x, test_x, train_indices)
         train_x = train_x[:, None, :, :]
         test_x = test_x[:, None, :, :]
-    return {
+    result = {
         "train_x": train_x[train_indices],
         "train_y": train_y[train_indices],
         "validation_x": train_x[validation_indices],
         "validation_y": train_y[validation_indices],
         "test_x": test_x,
         "test_y": test_y,
+        "norm_stats": norm_stats,
         "excluded_train_artifacts": np.asarray(int(training["artifact"].sum())),
         "excluded_test_artifacts": np.asarray(int(evaluation["artifact"].sum())),
     }
+    if keep_raw:
+        # Unfiltered trials aligned with the splits; used to augment before
+        # filter-bank construction (segment splicing on filtered data breaks
+        # causal filter continuity at the splice points).
+        raw_train = training["raw_x"][train_keep]
+        raw_test = evaluation["raw_x"][test_keep]
+        result["train_raw_x"] = raw_train[train_indices]
+        result["validation_raw_x"] = raw_train[validation_indices]
+        result["test_raw_x"] = raw_test
+    return result
 
 
 def segment_reconstruction(
@@ -246,6 +305,7 @@ def train_subject(model_name: str, subject: int, config: TrainConfig) -> dict[st
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     augmentation_rng = np.random.default_rng(config.seed + subject)
     best_state, best_validation, best_epoch, epochs_without_improvement = None, -1.0, 0, 0
+    best_validation_metrics: dict[str, object] = {}
     started = time.perf_counter()
 
     for epoch in range(1, config.epochs + 1):
@@ -281,6 +341,7 @@ def train_subject(model_name: str, subject: int, config: TrainConfig) -> dict[st
         if validation["accuracy"] > best_validation:
             best_validation = float(validation["accuracy"])
             best_epoch = epoch
+            best_validation_metrics = validation
             best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
             epochs_without_improvement = 0
         else:
@@ -309,7 +370,10 @@ def train_subject(model_name: str, subject: int, config: TrainConfig) -> dict[st
             "model_name": model_name,
             "subject": subject,
             "config": asdict(config),
+            "norm_stats": norm_stats_to_serializable(data["norm_stats"]),
+            "repo_revision": repo_revision(),
             "validation_accuracy": best_validation,
+            "validation_metrics_at_best": best_validation_metrics,
             "test_metrics": test_metrics,
         },
         checkpoint,
@@ -374,6 +438,7 @@ def save_results(results: list[dict[str, object]], config: TrainConfig, path: st
         str(row["model"]): row.get("training_config", asdict(config)) for row in results
     }
     payload = {
+        "repo_revision": repo_revision(),
         "configs_by_model": configs_by_model,
         "results": results,
         "summary": summarize_results(results),

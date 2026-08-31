@@ -14,7 +14,11 @@ import numpy as np
 
 from bci_maze.lk_mini.cli import add_source_arguments, source_from_args
 from bci_maze.lk_mini.model import load_model_bundle
-from bci_maze.lk_mini.online import ProbabilitySmoother, RollingEEGBuffer
+from bci_maze.lk_mini.online import (
+    ProbabilitySmoother,
+    RollingEEGBuffer,
+    validate_stream_metadata,
+)
 from bci_maze.lk_mini.quality import assess_signal_quality
 
 
@@ -51,16 +55,8 @@ def main() -> int:
 
     bundle = load_model_bundle(args.model)
     source = source_from_args(args)
-    if args.sample_rate != bundle.config.sample_rate:
-        raise ValueError(
-            f"CLI sample rate {args.sample_rate} does not match model {bundle.config.sample_rate}"
-        )
-    if tuple(args.channel_names) != bundle.channel_names:
-        raise ValueError(
-            f"CLI channel names {tuple(args.channel_names)} do not match model {bundle.channel_names}"
-        )
-    window_samples = int(round(bundle.config.epoch_seconds * args.sample_rate))
-    step_samples = max(1, int(round(args.step_seconds * args.sample_rate)))
+    window_samples = int(round(bundle.config.epoch_seconds * bundle.config.sample_rate))
+    step_samples = max(1, int(round(args.step_seconds * bundle.config.sample_rate)))
     buffer = RollingEEGBuffer(len(bundle.channel_names), window_samples + step_samples)
     smoother = ProbabilitySmoother(
         bundle.classes,
@@ -83,12 +79,18 @@ def main() -> int:
 
     samples_since_decision = 0
     last_command_time = -1e9
-    print(
-        f"在线分类已启动：subject={bundle.subject_id}, classes={bundle.classes}, "
-        f"window={bundle.config.epoch_seconds}s, step={args.step_seconds}s"
-    )
     try:
         with source, decisions_path.open("a", encoding="utf-8") as log_file:
+            sample_rate, channel_names = validate_stream_metadata(
+                source.sample_rate,
+                source.channel_names,
+                expected_sample_rate=bundle.config.sample_rate,
+                expected_channel_names=bundle.channel_names,
+            )
+            print(
+                f"在线分类已启动：subject={bundle.subject_id}, classes={bundle.classes}, "
+                f"window={bundle.config.epoch_seconds}s, step={args.step_seconds}s"
+            )
             started = time.monotonic()
             while args.duration <= 0 or time.monotonic() - started < args.duration:
                 chunk = source.read(timeout=0.25)
@@ -100,18 +102,25 @@ def main() -> int:
                     continue
                 samples_since_decision %= step_samples
                 window = buffer.latest(window_samples)
-                quality = assess_signal_quality(window[:, -min(window_samples, args.sample_rate * 2) :], args.sample_rate)
+                quality = assess_signal_quality(window, sample_rate)
                 bad_channels = [name for name, item in zip(bundle.channel_names, quality) if item.status == "bad"]
                 record: dict[str, object] = {
                     "timestamp_utc": datetime.now(timezone.utc).isoformat(),
                     "bad_channels": bad_channels,
                 }
                 if bad_channels:
+                    smoother.reset()
                     record.update({"label": "unknown", "accepted": False, "reason": "bad_signal"})
                     print(f"unknown | bad_signal | bad_channels={bad_channels}")
+                    if bars is not None:
+                        for bar in bars:
+                            bar.set_height(0.0)
+                        status_text.set_text(f"结果：unknown  bad_signal  {', '.join(bad_channels)}")
+                        figure.canvas.draw_idle()
+                        figure.canvas.flush_events()
                 else:
                     raw_probabilities = bundle.predict_proba(
-                        window, args.sample_rate, bundle.channel_names
+                        window, sample_rate, channel_names
                     )[0]
                     decision = smoother.update(raw_probabilities)
                     record.update(

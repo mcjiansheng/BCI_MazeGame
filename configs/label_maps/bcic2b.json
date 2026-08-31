@@ -1,0 +1,9 @@
+{
+  "dataset": "bcic2b",
+  "description": "BCI Competition IV 2b two-class motor imagery mapped to maze commands.",
+  "labels": ["left_hand", "right_hand"],
+  "commands": {
+    "left_hand": "left",
+    "right_hand": "right"
+  }
+}

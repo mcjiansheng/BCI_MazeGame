@@ -1,0 +1,11 @@
+{
+  "dataset": "bcic2a",
+  "description": "BCI Competition IV 2a four-class motor imagery mapped to maze commands. 'tongue' is reserved as the rest/stop class and maps to no movement.",
+  "labels": ["left_hand", "right_hand", "feet", "tongue"],
+  "commands": {
+    "left_hand": "left",
+    "right_hand": "right",
+    "feet": "up",
+    "tongue": null
+  }
+}

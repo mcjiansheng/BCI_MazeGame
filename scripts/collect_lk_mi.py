@@ -151,8 +151,14 @@ def main() -> int:
     args = parser.parse_args()
 
     classes = tuple(part.strip() for part in args.classes.split(",") if part.strip())
-    if len(classes) < 2 or any(label not in INSTRUCTIONS for label in classes):
-        raise ValueError(f"Choose at least two classes from {tuple(INSTRUCTIONS)}")
+    if (
+        len(classes) < 2
+        or len(set(classes)) != len(classes)
+        or any(label not in INSTRUCTIONS for label in classes)
+    ):
+        raise ValueError(
+            f"Choose at least two distinct classes from {tuple(INSTRUCTIONS)}"
+        )
     schedule = make_schedule(classes, args.blocks, args.trials_per_class, args.seed)
     output = args.output or Path("data/recordings") / args.subject / f"{args.session}.npz"
     source = source_from_args(args)
@@ -161,15 +167,27 @@ def main() -> int:
     epochs: list[np.ndarray] = []
     labels: list[str] = []
     rng = random.Random(args.seed + 1)
+    actual_sample_rate = int(args.sample_rate)
+    actual_channel_names = tuple(args.channel_names)
+    recording_error: BaseException | None = None
+    recording_traceback = None
+    recorder = ContinuousRecorder(source)
 
     try:
-        with ContinuousRecorder(source) as recorder:
+        with recorder:
+            actual_sample_rate = int(source.sample_rate)
+            actual_channel_names = tuple(source.channel_names)
+            if actual_sample_rate <= 0 or not actual_channel_names:
+                raise RuntimeError("EEG source did not expose valid stream metadata")
+
             def quality_provider() -> tuple[int, int]:
-                needed = args.sample_rate * 2
+                if recorder.error is not None:
+                    raise RuntimeError("EEG recorder stopped unexpectedly") from recorder.error
+                needed = actual_sample_rate * 2
                 data = recorder.recent(needed)
                 if data.shape[1] < needed:
-                    return 0, len(args.channel_names)
-                quality = assess_signal_quality(data, args.sample_rate)
+                    return 0, len(actual_channel_names)
+                quality = assess_signal_quality(data, actual_sample_rate)
                 return sum(item.status != "bad" for item in quality), len(quality)
 
             if not display.show(
@@ -217,7 +235,9 @@ def main() -> int:
                     quality_provider,
                 ):
                     break
-                stop_sample = start_sample + int(round(args.imagery_seconds * args.sample_rate))
+                stop_sample = start_sample + int(
+                    round(args.imagery_seconds * actual_sample_rate)
+                )
                 if not recorder.wait_for_samples(stop_sample, timeout=2.0):
                     raise RuntimeError(
                         f"EEG stream did not deliver {stop_sample - start_sample} samples in time"
@@ -246,12 +266,16 @@ def main() -> int:
                     quality_provider,
                 ):
                     break
-
-            continuous, timestamps = recorder.snapshot()
+    except BaseException as exception:
+        recording_error = exception
+        recording_traceback = exception.__traceback__
     finally:
+        continuous, timestamps = recorder.snapshot()
         display.close()
 
     if not epochs:
+        if recording_error is not None:
+            raise recording_error.with_traceback(recording_traceback)
         print("没有完成的 trial，未写入记录文件。")
         return 2
     destination = save_mi_recording(
@@ -261,8 +285,8 @@ def main() -> int:
         epochs=np.stack(epochs),
         labels=labels,
         trials=trials,
-        sample_rate=args.sample_rate,
-        channel_names=args.channel_names,
+        sample_rate=actual_sample_rate,
+        channel_names=actual_channel_names,
         subject_id=args.subject,
         session_id=args.session,
         configuration={
@@ -279,6 +303,9 @@ def main() -> int:
         f"已保存 {len(epochs)} 个 trial 到 {destination}；"
         f"伪迹标记 {sum(trial.artifact for trial in trials)} 个。"
     )
+    if recording_error is not None:
+        print("采集发生异常；以上已完成 trial 已作为部分记录安全保存。")
+        raise recording_error.with_traceback(recording_traceback)
     return 0
 
 

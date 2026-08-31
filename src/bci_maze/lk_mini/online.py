@@ -9,10 +9,35 @@ from typing import Sequence
 import numpy as np
 
 
+def validate_stream_metadata(
+    sample_rate: int,
+    channel_names: Sequence[str],
+    *,
+    expected_sample_rate: int,
+    expected_channel_names: Sequence[str],
+) -> tuple[int, tuple[str, ...]]:
+    """Validate metadata exposed by an already-started EEG source."""
+
+    actual_rate = int(sample_rate)
+    actual_channels = tuple(channel_names)
+    expected_channels = tuple(expected_channel_names)
+    if actual_rate != int(expected_sample_rate):
+        raise ValueError(
+            f"EEG source is {actual_rate} Hz but model requires {expected_sample_rate} Hz"
+        )
+    if actual_channels != expected_channels:
+        raise ValueError(
+            f"EEG source channels {actual_channels} do not match model {expected_channels}"
+        )
+    return actual_rate, actual_channels
+
+
 class RollingEEGBuffer:
     def __init__(self, n_channels: int, capacity_samples: int):
         self.n_channels = int(n_channels)
         self.capacity_samples = int(capacity_samples)
+        if self.n_channels <= 0 or self.capacity_samples <= 0:
+            raise ValueError("n_channels and capacity_samples must be positive")
         self._data = np.empty((self.n_channels, 0), dtype=np.float64)
 
     @property
@@ -52,13 +77,31 @@ class ProbabilitySmoother:
         margin_threshold: float = 0.15,
     ):
         self.classes = tuple(classes)
-        self.history = deque(maxlen=int(history))
+        if len(self.classes) < 2 or len(set(self.classes)) != len(self.classes):
+            raise ValueError("classes must contain at least two unique labels")
+        history_length = int(history)
+        if history_length <= 0:
+            raise ValueError("history must be positive")
+        if not 0.0 <= confidence_threshold <= 1.0:
+            raise ValueError("confidence_threshold must be between 0 and 1")
+        if not 0.0 <= margin_threshold <= 1.0:
+            raise ValueError("margin_threshold must be between 0 and 1")
+        self.history = deque(maxlen=history_length)
         self.confidence_threshold = float(confidence_threshold)
         self.margin_threshold = float(margin_threshold)
 
+    def reset(self) -> None:
+        """Discard stale probabilities after a rejected or interrupted stream."""
+
+        self.history.clear()
+
     def update(self, probabilities: Sequence[float]) -> OnlineDecision:
         values = np.asarray(probabilities, dtype=np.float64)
-        if values.shape != (len(self.classes),) or not np.isfinite(values).all():
+        if (
+            values.shape != (len(self.classes),)
+            or not np.isfinite(values).all()
+            or np.any(values < 0)
+        ):
             raise ValueError("probabilities do not match model classes")
         total = float(values.sum())
         if total <= 0:

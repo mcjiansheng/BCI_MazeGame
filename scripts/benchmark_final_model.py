@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import time
 from dataclasses import asdict
@@ -16,10 +17,13 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from bci_maze.models import build_model
+from bci_maze.preprocessing import make_filter_bank
 from bci_maze.training import (
     TrainConfig,
     evaluate,
+    norm_stats_to_serializable,
     prepare_subject_data,
+    repo_revision,
     save_results,
     seed_everything,
     segment_reconstruction,
@@ -101,6 +105,7 @@ def train_subject(
         config.seed + subject,
         config.exclude_artifacts,
         config.file_prefix,
+        keep_raw=True,
     )
     tensors = {
         key: torch.from_numpy(data[key])
@@ -174,16 +179,36 @@ def train_subject(
             model.expert_mix_logits.copy_(route)
     without_improvement = 0
     started = time.perf_counter()
+    best_validation_metrics: dict = {}
+    norm_mean = np.asarray(data["norm_stats"]["mean"], dtype=np.float32)
+    norm_std = np.asarray(data["norm_stats"]["std"], dtype=np.float32).clip(min=1e-6)
 
     for epoch in range(1, config.epochs + 1):
         model.train()
-        for x, y in loaders["train"]:
-            if config.augment:
-                aug_x, aug_y = segment_reconstruction(
-                    data["train_x"], data["train_y"], max(1, x.shape[0] // n_classes), rng=rng
-                )
-                x = torch.cat((x, torch.from_numpy(aug_x)), dim=0)
-                y = torch.cat((y, torch.from_numpy(aug_y)), dim=0)
+        epoch_dataset = TensorDataset(tensors["train_x"], tensors["train_y"])
+        if config.augment:
+            # Reconstruct raw (unfiltered) trials first, then build the filter
+            # bank. Splicing already-filtered segments would break causal
+            # filter continuity at the splice points and create augmented
+            # samples whose statistics differ from real trials.
+            n_batches = max(1, math.ceil(tensors["train_y"].shape[0] / config.batch_size))
+            samples_per_class = max(1, (config.batch_size // n_classes) * n_batches)
+            aug_raw, aug_y = segment_reconstruction(
+                data["train_raw_x"], data["train_y"], samples_per_class, rng=rng
+            )
+            aug_x = make_filter_bank(aug_raw)
+            aug_x = ((aug_x - norm_mean) / norm_std).astype(np.float32)
+            epoch_dataset = TensorDataset(
+                torch.cat((tensors["train_x"], torch.from_numpy(aug_x)), dim=0),
+                torch.cat((tensors["train_y"], torch.from_numpy(aug_y)), dim=0),
+            )
+        epoch_loader = DataLoader(
+            epoch_dataset,
+            batch_size=config.batch_size,
+            shuffle=True,
+            pin_memory=device.type == "cuda",
+        )
+        for x, y in epoch_loader:
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast(device_type=device.type, enabled=use_amp):
@@ -205,6 +230,7 @@ def train_subject(
         if qualifies and validation["accuracy"] > best_validation:
             best_validation = float(validation["accuracy"])
             best_epoch = epoch
+            best_validation_metrics = validation
             best_state = {
                 key: value.detach().cpu().clone() for key, value in model.state_dict().items()
             }
@@ -230,10 +256,13 @@ def train_subject(
             "logvar_only": logvar_only,
             "subject": subject,
             "config": asdict(config),
+            "norm_stats": norm_stats_to_serializable(data["norm_stats"]),
+            "repo_revision": repo_revision(),
             "backbone_checkpoint": baseline["checkpoint"],
             "temporal_expert_checkpoint": temporal_expert["checkpoint"] if temporal_expert else None,
             "baseline_validation_accuracy": baseline_validation,
             "validation_accuracy": best_validation,
+            "validation_metrics_at_best": best_validation_metrics,
             "test_metrics": test_metrics,
         },
         checkpoint,
@@ -287,6 +316,7 @@ def main() -> None:
     parser.add_argument("--patience", type=int, default=80)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--no-augment", action="store_true")
     parser.add_argument("--logvar-only", action="store_true")
     parser.add_argument(
@@ -307,6 +337,7 @@ def main() -> None:
         patience=args.patience,
         batch_size=args.batch_size,
         learning_rate=args.lr,
+        seed=args.seed,
         augment=not args.no_augment,
     )
     baselines = baseline_rows(args.baseline)

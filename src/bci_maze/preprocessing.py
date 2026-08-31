@@ -12,12 +12,14 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import TYPE_CHECKING, Iterable
 
-import mne
 import numpy as np
 from scipy.io import loadmat
 from scipy.signal import cheb2ord, cheby2, sosfilt, sosfiltfilt
+
+if TYPE_CHECKING:
+    import mne
 
 
 EEG_CHANNEL_COUNT = 22
@@ -80,6 +82,10 @@ def read_gdf_session(
     config: PreprocessConfig = PreprocessConfig(),
 ) -> dict[str, np.ndarray]:
     """Load one GDF session and return filtered trials plus metadata arrays."""
+    # MNE pulls in Numba/LLVM and is expensive to import.  Keep it out of the
+    # training and synthetic-test import path; only real GDF ingestion needs it.
+    import mne
+
     gdf_path = Path(gdf_path)
     label_path = Path(label_path)
     raw = mne.io.read_raw_gdf(gdf_path, preload=True, verbose="ERROR")
@@ -129,6 +135,35 @@ def read_gdf_session(
     }
 
 
+def design_filter_bank(
+    sfreq: float = 250.0,
+    bands: Iterable[tuple[float, float]] = FILTER_BANK_BANDS,
+    passband_ripple_db: float = 3.0,
+    attenuation: float = 30.0,
+    transition_hz: float = 2.0,
+) -> list[np.ndarray]:
+    """Design FBCNet's nine Chebyshev-II band-pass filters as SOS sections.
+
+    Exposed separately from ``make_filter_bank`` so streaming inference can
+    precompute the filters once and apply them causally per window.
+    """
+    sos_list: list[np.ndarray] = []
+    for low, high in bands:
+        passband = (low, high)
+        stopband = (low - transition_hz, high + transition_hz)
+        order, critical = cheb2ord(
+            passband,
+            stopband,
+            passband_ripple_db,
+            attenuation,
+            fs=sfreq,
+        )
+        sos_list.append(
+            cheby2(order, attenuation, critical, btype="bandpass", fs=sfreq, output="sos")
+        )
+    return sos_list
+
+
 def make_filter_bank(
     trials: np.ndarray,
     sfreq: float = 250.0,
@@ -144,26 +179,9 @@ def make_filter_bank(
     public ``filterBank`` transform. Their default is causal filtering;
     ``zero_phase=True`` is available for offline ablations.
     """
-    bands = tuple(bands)
-    output = np.empty((trials.shape[0], len(bands), *trials.shape[1:]), dtype=np.float32)
-    for index, (low, high) in enumerate(bands):
-        passband = (low, high)
-        stopband = (low - transition_hz, high + transition_hz)
-        order, critical = cheb2ord(
-            passband,
-            stopband,
-            passband_ripple_db,
-            attenuation,
-            fs=sfreq,
-        )
-        sos = cheby2(
-            order,
-            attenuation,
-            critical,
-            btype="bandpass",
-            fs=sfreq,
-            output="sos",
-        )
+    sos_list = design_filter_bank(sfreq, bands, passband_ripple_db, attenuation, transition_hz)
+    output = np.empty((trials.shape[0], len(sos_list), *trials.shape[1:]), dtype=np.float32)
+    for index, sos in enumerate(sos_list):
         filter_fn = sosfiltfilt if zero_phase else sosfilt
         output[:, index] = filter_fn(sos, trials, axis=-1).astype(np.float32, copy=False)
     return output

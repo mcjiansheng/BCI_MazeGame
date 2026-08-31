@@ -396,9 +396,11 @@ public sealed class MazeGameController : MonoBehaviour
     {
         if (walkable == null) return;
         const int width = 440;
-        GUI.Box(new Rect(16, 16, width, 112), "BCI Maze — Large Random Map");
+        GUI.Box(new Rect(16, 16, width, 136), "BCI Maze — Large Random Map");
         GUI.Label(new Rect(30, 45, width - 24, 24), "Move: WASD / Arrow keys  |  New maze: R  |  Hint: H  |  View: V");
         GUI.Label(new Rect(30, 68, width - 24, 24), "External UDP: 127.0.0.1:7777  (up, down, left, right)");
         GUI.Label(new Rect(30, 91, width - 24, 24), status);
+        if (ExternalMazeInput.Instance != null)
+            GUI.Label(new Rect(30, 114, width - 24, 24), ExternalMazeInput.Instance.LinkStatus);
     }
 }

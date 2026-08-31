@@ -13,6 +13,7 @@
 - [SE-MHAF-Conformer 最终优化与验证报告](SE-MHAF-Conformer_最终优化与验证报告.md)：Final 模型、验证结果和复现实验入口。
 - [迷宫生成与寻路算法原理](迷宫生成与寻路算法原理.md)：Unity 迷宫生成、BFS 寻路和可视化逻辑。
 - [Unity BCI Maze 接口说明](../Maze-game/Assets/README_BCI_Maze.md)：键盘操作、UDP 协议、ACK 语义和 Python 联调。
+- [LK-Mini-EEG16 在线 MI 系统调研与实施工作流](在线MI系统调研与实施工作流.md)：设备资料依据、外部项目与论文调研、当前问题、目标架构、任务顺序和验收条件。
 
 ## 外部 Box 资料
 

@@ -14,6 +14,7 @@
 - [迷宫生成与寻路算法原理](迷宫生成与寻路算法原理.md)：Unity 迷宫生成、BFS 寻路和可视化逻辑。
 - [Unity BCI Maze 接口说明](../Maze-game/Assets/README_BCI_Maze.md)：键盘操作、UDP 协议、ACK 语义和 Python 联调。
 - [LK-Mini-EEG16 在线 MI 系统调研与实施工作流](在线MI系统调研与实施工作流.md)：设备资料依据、外部项目与论文调研、当前问题、目标架构、任务顺序和验收条件。
+- [LK-Mini-EEG16 运动想象实验操作手册](LK-Mini-EEG16运动想象实验操作手册.md)：面向新手的戴帽接线、OpenBCI GUI、BrainFlow/LSL、通道验证、被试提示、采集、训练、在线分类和排障步骤。
 
 ## 外部 Box 资料
 

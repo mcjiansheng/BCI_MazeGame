@@ -44,6 +44,7 @@ py -3.11 -m venv .venv
 python -m pip install --upgrade pip
 # 先按 https://pytorch.org/ 安装适合本机的 PyTorch
 pip install -r requirements.txt
+pip install -e . --no-deps
 ~~~
 
 当前验证环境为 Python 3.11、PyTorch 2.5.1+cu121、MNE 1.8.0 和 NVIDIA RTX 4080 Laptop GPU。其他环境仍应重新运行测试和实验。
@@ -153,13 +154,33 @@ python scripts/run_bci_maze_integration.py --host 127.0.0.1 --port 7777
 
 该脚本读取 BCIC2a A01 的 E 测试数据和默认 Final checkpoint，把预测类别映射为方向并等待 Unity ACK。它是端到端冒烟测试，不是迷宫通关率评估；墙体阻挡、无效方向或模型预测错误都会导致某次命令未被接受。
 
+## LK-Mini-EEG16 真实设备与受试者 MI
+
+仓库新增了 LK-Mini-EEG16 的真实采集链路，支持 BrainFlow 直连、OpenBCI GUI LSL、NPZ 回放和合成信号。首轮验证采用 8 个感觉运动区通道和左右手二分类 CSP+LDA：
+
+~~~powershell
+# 1. 连接与通道质量检查
+python scripts/lk_mini_check.py --backend brainflow --duration 60
+
+# 2. 视觉提示下采集每类 40 个 trial
+python scripts/collect_lk_mi.py --subject S01 --backend brainflow --fullscreen
+
+# 3. 训练受试者模型
+python scripts/train_lk_mi.py data/recordings/S01/<session>.npz --subject S01
+
+# 4. 实时滑窗分类
+python scripts/online_lk_mi.py --model outputs/subject_models/S01/csp_lda.joblib --backend brainflow --plot
+~~~
+
+默认通道顺序为 `FC3, FC4, C3, Cz, C4, CP3, CPz, CP4`，对应设备 CH1-CH8。模型会校验采样率和通道顺序；低置信度、类别概率差距不足或信号坏道时输出 `unknown`。详细接线、OpenBCI GUI/LSL 配置、运动想象方法、验收标准和排障见 [LK-Mini-EEG16 运动想象实验操作手册](doc/LK-Mini-EEG16运动想象实验操作手册.md)。外部调研与整体工作流见 [在线 MI 系统调研与实施工作流](doc/在线MI系统调研与实施工作流.md)。
+
 ## 测试
 
 ~~~powershell
 .\.venv\Scripts\python.exe -m pytest -q
 ~~~
 
-测试覆盖预处理、模型构造、形状约束和若干训练工具函数。涉及真实数据或 GPU 的实验不属于 pytest 的默认范围。
+测试覆盖预处理、模型构造、形状约束、LK-Mini 设备命令、合成数据源、录制切片、信号质量、CSP+LDA 保存回载以及在线缓冲/拒识。涉及真实数据、真实硬件或 GPU 的实验不属于 pytest 的默认范围。
 
 ## 目录结构
 

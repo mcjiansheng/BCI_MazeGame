@@ -3,7 +3,10 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 data/processed/
+data/recordings/
 outputs/checkpoints/
+outputs/subject_models/
+outputs/online/
 outputs/*.json
 outputs/*.csv
 tmp/

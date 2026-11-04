@@ -29,6 +29,15 @@ def display_path(path: Path) -> str:
         return str(resolved)
 
 
+def default_export_path(checkpoint_path: Path, checkpoint: dict) -> Path:
+    """Build a collision-resistant path from dataset, model and subject."""
+    config = checkpoint.get("config", {})
+    dataset = str(config.get("dataset_name") or checkpoint_path.parent.parent.name)
+    model_name = str(checkpoint.get("model_name") or checkpoint_path.parent.name)
+    filename = f"{dataset}-{model_name}-{checkpoint_path.stem}.torchscript.pt"
+    return ROOT / "outputs" / "exports" / filename
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", required=True)
@@ -63,7 +72,11 @@ def main() -> int:
             difference = (model(batch) - traced(batch)).abs().max().item()
             max_difference = max(max_difference, difference)
 
-    output = Path(args.output) if args.output else ROOT / "outputs" / "exports" / f"{checkpoint_path.stem}.torchscript.pt"
+    output = (
+        Path(args.output)
+        if args.output
+        else default_export_path(checkpoint_path, checkpoint)
+    )
     output.parent.mkdir(parents=True, exist_ok=True)
     traced.save(str(output))
     print(

@@ -4,6 +4,7 @@ import pytest
 from bci_maze.lk_mini.online import (
     ProbabilitySmoother,
     RollingEEGBuffer,
+    classify_mi_window,
     validate_stream_metadata,
 )
 from bci_maze.lk_mini.source import ReplaySource
@@ -77,3 +78,39 @@ def test_replay_metadata_is_validated_after_source_start(tmp_path):
             expected_sample_rate=500,
             expected_channel_names=channels,
         ) == (500, channels)
+
+
+def test_online_quality_gate_rejects_flat_signal():
+    class Bundle:
+        classes = ("left_hand", "right_hand")
+
+        def predict_proba(self, *_args):
+            raise AssertionError("bad signals must not reach the model")
+
+    result = classify_mi_window(
+        Bundle(),
+        ProbabilitySmoother(Bundle.classes, history=1),
+        np.zeros((2, 1000)),
+        250,
+        ("C3", "C4"),
+    )
+    assert not result.decision.accepted
+    assert result.decision.reason == "bad_signal"
+    assert result.bad_channels == ("C3", "C4")
+
+
+def test_online_rejects_severe_mains_warning_before_model():
+    class Bundle:
+        classes = ("left_hand", "right_hand")
+
+        def predict_proba(self, *_args):
+            raise AssertionError("mains-dominated windows must not reach the model")
+
+    seconds = np.arange(1000) / 250
+    data = np.tile(20 * np.sin(2 * np.pi * 50 * seconds), (16, 1))
+    from bci_maze.lk_mini.source import DEFAULT_CHANNEL_NAMES
+    result = classify_mi_window(
+        Bundle(), ProbabilitySmoother(Bundle.classes), data, 250, DEFAULT_CHANNEL_NAMES,
+    )
+    assert result.bad_channels == DEFAULT_CHANNEL_NAMES
+    assert not result.decision.accepted

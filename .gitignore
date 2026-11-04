@@ -8,7 +8,9 @@ data/processed/
 data/recordings/
 outputs/checkpoints/
 outputs/subject_models/
+outputs/experiments/
 outputs/online/
+outputs/lk_mini_workflow/
 outputs/*.json
 outputs/*.csv
 tmp/
@@ -32,6 +34,8 @@ outputs/ablations/checkpoints/
 
 # Exported deployment artifacts (TorchScript/ONNX).
 outputs/exports/
+outputs/lk_mini_16_workflow/
+.venv-mi/
 
 # Personal papers, presentations, defense materials, and reference papers.
 doc/**/*.pdf
@@ -45,3 +49,17 @@ doc/**/*答辩*.md
 doc/**/*中期考核*.md
 doc/Box资料阅读与项目参考分析.md
 doc/参考论文/
+
+# Local acquisition archives, vendor applications, credentials, and slide scratch data.
+data/archive/
+OpenBCI_GUI/
+doc/LK-Mini-EEG16/
+doc/CODEXAPI.txt
+doc/比赛准备/
+.chart-data-*/
+outputs/connection_*/
+outputs/environment_restore_*/
+outputs/pretrained/
+outputs/semhaf_*/
+outputs/semhaf_live_*/
+outputs/unity_mcp/

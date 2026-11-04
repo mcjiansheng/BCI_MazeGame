@@ -135,6 +135,44 @@ def apply_norm_stats(x: np.ndarray, stats: dict[str, object]) -> np.ndarray:
     return ((x - mean) / std).astype(np.float32)
 
 
+def prepare_evaluation_session(
+    session: dict[str, np.ndarray],
+    model_name: str,
+    norm_stats: dict[str, object],
+    *,
+    exclude_artifacts: bool,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Prepare an evaluation session with a checkpoint's frozen statistics."""
+    keep = (
+        ~session["artifact"]
+        if exclude_artifacts
+        else np.ones_like(session["artifact"], dtype=bool)
+    )
+    source_key = (
+        "raw_x"
+        if uses_filter_bank(model_name) or uses_raw_broadband(model_name)
+        else "x"
+    )
+    if source_key not in session:
+        raise KeyError(
+            f"Processed data has no {source_key!r}; rerun preprocessing with --overwrite"
+        )
+    values = session[source_key][keep]
+    labels = session["y"][keep]
+    expected_mode = "filter_bank" if uses_filter_bank(model_name) else "broadband"
+    if norm_stats.get("mode") != expected_mode:
+        raise ValueError(
+            f"norm_stats mode {norm_stats.get('mode')!r} does not match "
+            f"model input {expected_mode!r}"
+        )
+    if uses_filter_bank(model_name):
+        values = make_filter_bank(values)
+        values = apply_norm_stats(values, norm_stats)
+    else:
+        values = apply_norm_stats(values, norm_stats)[:, None, :, :]
+    return values, labels
+
+
 def prepare_subject_data(
     processed_dir: str | Path,
     subject: int,

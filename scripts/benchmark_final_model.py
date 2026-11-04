@@ -151,9 +151,11 @@ def train_subject(
     use_amp = config.amp and device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     rng = np.random.default_rng(config.seed + subject)
-    baseline_validation = evaluate(model, loaders["validation"], device)["accuracy"]
-    best_validation = float(baseline_validation)
+    baseline_validation_metrics = evaluate(model, loaders["validation"], device)
+    baseline_validation = float(baseline_validation_metrics["accuracy"])
+    best_validation = baseline_validation
     best_epoch = 0
+    best_validation_metrics = baseline_validation_metrics
     best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
     progress_validation = float(baseline_validation)
     if temporal_expert is not None and not logvar_only:
@@ -161,11 +163,13 @@ def train_subject(
         for alpha in np.linspace(0.05, 0.5, 10):
             with torch.no_grad():
                 model.residual_scale.fill_(float(np.arctanh(alpha)))
-            calibrated = float(evaluate(model, loaders["validation"], device)["accuracy"])
+            calibrated_metrics = evaluate(model, loaders["validation"], device)
+            calibrated = float(calibrated_metrics["accuracy"])
             if calibrated >= baseline_validation + min_validation_gain and calibrated > best_validation:
                 temporal_qualified = True
                 best_validation = calibrated
                 best_epoch = -1
+                best_validation_metrics = calibrated_metrics
                 best_state = {
                     key: value.detach().cpu().clone()
                     for key, value in model.state_dict().items()
@@ -179,7 +183,6 @@ def train_subject(
             model.expert_mix_logits.copy_(route)
     without_improvement = 0
     started = time.perf_counter()
-    best_validation_metrics: dict = {}
     norm_mean = np.asarray(data["norm_stats"]["mean"], dtype=np.float32)
     norm_std = np.asarray(data["norm_stats"]["std"], dtype=np.float32).clip(min=1e-6)
 

@@ -7,6 +7,7 @@ from bci_maze.training import (
     _normalize_filter_bank,
     apply_norm_stats,
     norm_stats_to_serializable,
+    prepare_evaluation_session,
     prepare_subject_data,
     repo_revision,
     segment_reconstruction,
@@ -101,3 +102,33 @@ def test_repo_revision_returns_string():
     revision = repo_revision()
     assert isinstance(revision, str)
     assert revision != ""
+
+
+def test_prepare_evaluation_session_uses_frozen_stats_and_artifact_policy():
+    session = {
+        "x": np.asarray(
+            [
+                np.full((3, 100), 3.0, dtype=np.float32),
+                np.full((3, 100), 7.0, dtype=np.float32),
+            ]
+        ),
+        "y": np.asarray([0, 1]),
+        "artifact": np.asarray([False, True]),
+    }
+    stats = {
+        "mode": "broadband",
+        "mean": np.full((1, 3, 1), 1.0).tolist(),
+        "std": np.full((1, 3, 1), 2.0).tolist(),
+    }
+    values, labels = prepare_evaluation_session(
+        session, "eeg_conformer", stats, exclude_artifacts=True
+    )
+    assert values.shape == (1, 1, 3, 100)
+    assert np.allclose(values, 1.0)
+    assert labels.tolist() == [0]
+
+    all_values, all_labels = prepare_evaluation_session(
+        session, "eeg_conformer", stats, exclude_artifacts=False
+    )
+    assert all_values.shape[0] == 2
+    assert all_labels.tolist() == [0, 1]

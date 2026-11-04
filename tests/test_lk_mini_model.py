@@ -7,6 +7,8 @@ from bci_maze.lk_mini.model import (
     save_model_bundle,
     train_subject_model,
 )
+from bci_maze.lk_mini.source import DEFAULT_CHANNEL_NAMES, LEGACY_CHANNEL_NAMES
+from bci_maze.lk_mini.online import ProbabilitySmoother, classify_mi_window
 
 
 def make_mi_epochs():
@@ -52,3 +54,38 @@ def test_csp_lda_training_round_trip(tmp_path):
     assert np.isclose(probabilities.sum(), 1.0)
     with pytest.raises(ValueError):
         loaded.predict_proba(epochs[0], 500, channels)
+
+
+def test_sixteen_channel_model_learns_upper_bank_and_rejects_mismatched_inputs(tmp_path):
+    rng = np.random.default_rng(104)
+    labels = np.tile(["left_hand", "right_hand"], 16)
+    groups = np.repeat(np.arange(4), 8)
+    epochs = rng.normal(0, 2, (32, 16, 1000))
+    wave = np.sin(2 * np.pi * 10 * np.arange(1000) / 250)
+    for index, label in enumerate(labels):
+        epochs[index, 9 if label == "left_hand" else 15] += 15 * wave
+    bundle, report = train_subject_model(
+        epochs, labels, groups, channel_names=DEFAULT_CHANNEL_NAMES,
+        subject_id="TEST16", training_files=(), config=MIModelConfig(),
+    )
+    assert report["accuracy"] > 0.9
+    assert report["channel_count"] == 16
+    assert len(report["physiology"]["mu_8_13_hz_by_channel"]) == 16
+    assert bundle.pipeline.named_steps["csp"].filters_.shape == (4, 16)
+    bundle = load_model_bundle(save_model_bundle(bundle, report, tmp_path / "mi16.joblib"))
+    assert bundle.classes[np.argmax(bundle.predict_proba(epochs[0], 250, DEFAULT_CHANNEL_NAMES))] == labels[0]
+    with pytest.raises(ValueError, match="channel order"):
+        bundle.predict_proba(epochs[0, :8], 250, LEGACY_CHANNEL_NAMES)
+    wrong_names = list(DEFAULT_CHANNEL_NAMES)
+    wrong_names[8], wrong_names[15] = wrong_names[15], wrong_names[8]
+    with pytest.raises(ValueError, match="channel order"):
+        bundle.predict_proba(epochs[0], 250, wrong_names)
+    damaged = epochs[0].copy()
+    damaged[15] = 0
+    result = classify_mi_window(
+        bundle, ProbabilitySmoother(bundle.classes, history=1),
+        damaged, 250, DEFAULT_CHANNEL_NAMES,
+    )
+    assert result.bad_channels == ("CP2",)
+    assert result.decision.reason == "bad_signal"
+    assert not result.decision.accepted

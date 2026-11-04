@@ -23,12 +23,21 @@ def main() -> int:
     args = parser.parse_args()
 
     loaded = load_mi_recordings(args.recordings)
+    recorded_subjects = {
+        str(metadata.get("subject_id")) for metadata in loaded["metadata"]
+    }
+    if recorded_subjects != {args.subject}:
+        raise ValueError(
+            f"Recording subject IDs {sorted(recorded_subjects)} do not match "
+            f"--subject {args.subject!r}"
+        )
     keep = ~loaded["artifact"] if not args.include_artifacts else slice(None)
     epochs = loaded["epochs"][keep]
     labels = loaded["labels"][keep]
     blocks = loaded["blocks"][keep]
     sample_rate = int(loaded["sample_rate"].item())
     channel_names = tuple(loaded["channel_names"].tolist())
+    print(f"训练输入：{len(epochs)} trials × {len(channel_names)} 通道，{sample_rate} Hz")
     epoch_seconds = epochs.shape[-1] / sample_rate
     config = MIModelConfig(
         sample_rate=sample_rate,

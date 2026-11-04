@@ -14,12 +14,12 @@ from ..models import build_model
 from ..preprocessing import design_filter_bank
 from ..training import apply_norm_stats, uses_filter_bank, uses_raw_broadband
 
-VALID_COMMANDS = ("up", "down", "left", "right")
+VALID_COMMANDS = ("up", "down", "left", "right", "forward", "uturn", "pause", "resume", "cancel")
 
 
 @dataclass(frozen=True)
 class LabelMap:
-    """Maps classifier class indices to maze commands (None = rest/stop)."""
+    """Maps class indices to maze commands (None = no command, not a game pause)."""
 
     labels: tuple[str, ...]
     commands: tuple[str | None, ...]

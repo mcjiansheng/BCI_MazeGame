@@ -12,6 +12,7 @@ from typing import Sequence
 import numpy as np
 
 from .source import EEGSource
+from .timing import StreamTimingGuard
 
 
 @dataclass
@@ -23,6 +24,7 @@ class TrialRecord:
     stop_sample: int
     cue_monotonic: float
     artifact: bool = False
+    segment_id: int = 0
 
 
 class ContinuousRecorder:
@@ -32,7 +34,10 @@ class ContinuousRecorder:
         self.source = source
         self._chunks: list[np.ndarray] = []
         self._timestamps: list[np.ndarray] = []
+        self._segment_ids: list[int] = []
+        self._segment_id = 0
         self._samples = 0
+        self._last_received_at: float | None = None
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -42,6 +47,27 @@ class ContinuousRecorder:
     def sample_count(self) -> int:
         with self._lock:
             return self._samples
+
+    @property
+    def segment_id(self) -> int:
+        with self._lock:
+            return self._segment_id
+
+    @property
+    def recovering(self) -> bool:
+        return bool(getattr(self.source, "recovering", False))
+
+    @property
+    def last_sample_age(self) -> float | None:
+        """Wall-clock age of the newest batch received by this recorder."""
+        with self._lock:
+            received = self._last_received_at
+        return None if received is None else max(0.0, time.monotonic() - received)
+
+    def cursor(self) -> tuple[int, int]:
+        """Take an atomic sample/segment marker at the imagery cue."""
+        with self._lock:
+            return self._samples, self._segment_id
 
     def start(self) -> None:
         if self._thread is not None:
@@ -53,27 +79,74 @@ class ContinuousRecorder:
 
     def _run(self) -> None:
         try:
+            timing = StreamTimingGuard(self.source.sample_rate)
+            last_sample_time = time.monotonic()
             while not self._stop_event.is_set():
                 chunk = self.source.read(timeout=0.25)
+                chunk_segment = int(chunk.segment_id)
+                with self._lock:
+                    changed = chunk_segment != self._segment_id
+                    self._segment_id = chunk_segment
+                if changed or self.recovering:
+                    timing = StreamTimingGuard(self.source.sample_rate)
+                    last_sample_time = time.monotonic()
                 if not chunk.data.shape[1]:
+                    if self.source.exhausted or (
+                        not self.recovering and time.monotonic() - last_sample_time >= 5.0
+                    ):
+                        raise RuntimeError("EEG source ended or produced no samples for 5 seconds")
                     continue
+                timing.check(chunk.monotonic_timestamps)
+                last_sample_time = time.monotonic()
                 with self._lock:
                     self._chunks.append(chunk.data.copy())
                     self._timestamps.append(chunk.monotonic_timestamps.copy())
+                    self._segment_ids.append(chunk_segment)
                     self._samples += chunk.data.shape[1]
+                    self._last_received_at = last_sample_time
         except BaseException as exception:
             self.error = exception
             self._stop_event.set()
 
-    def wait_for_samples(self, stop_sample: int, timeout: float) -> bool:
+    def wait_for_samples(
+        self, stop_sample: int, timeout: float, *, segment_id: int | None = None
+    ) -> bool:
         deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
+        while True:
+            # A later interruption does not invalidate samples already received.
+            # Check the actual endpoint's segment, not the current live segment;
+            # segment(start, stop) still validates the entire requested window.
+            available = self._target_available(stop_sample, segment_id)
+            if available is not None:
+                return available
             if self.error:
                 raise RuntimeError("EEG recorder stopped unexpectedly") from self.error
-            if self.sample_count >= stop_sample:
-                return True
+            if segment_id is not None and (self.segment_id != segment_id or self.recovering):
+                return False
+            if time.monotonic() >= deadline:
+                return False
             time.sleep(0.01)
-        return self.sample_count >= stop_sample
+
+    def _target_available(self, stop: int, segment: int | None) -> bool | None:
+        with self._lock:
+            if stop > self._samples:
+                return None
+            if segment is None or stop <= 0:
+                return True
+            cursor = self._samples
+            for chunk, chunk_segment in zip(reversed(self._chunks), reversed(self._segment_ids)):
+                start = cursor - chunk.shape[1]
+                if start < stop <= cursor:
+                    return chunk_segment == segment
+                cursor = start
+        return False
+
+    def snapshot_segment_ids(self) -> np.ndarray:
+        with self._lock:
+            return np.concatenate([
+                np.full(chunk.shape[1], segment, dtype=np.int64)
+                for chunk, segment in zip(self._chunks, self._segment_ids)
+            ]) if self._chunks else np.empty(0, dtype=np.int64)
 
     def snapshot(self) -> tuple[np.ndarray, np.ndarray]:
         with self._lock:
@@ -90,7 +163,9 @@ class ContinuousRecorder:
         with self._lock:
             remaining = min(samples, self._samples)
             selected: list[np.ndarray] = []
-            for chunk in reversed(self._chunks):
+            for chunk, segment in zip(reversed(self._chunks), reversed(self._segment_ids)):
+                if segment != self._segment_id:
+                    break
                 if remaining <= 0:
                     break
                 take = min(remaining, chunk.shape[1])
@@ -100,13 +175,14 @@ class ContinuousRecorder:
                 return np.empty((len(self.source.channel_names), 0), dtype=np.float64)
             return np.concatenate(selected[::-1], axis=1)
 
-    def segment(self, start: int, stop: int) -> np.ndarray:
+    def segment(self, start: int, stop: int, *, segment_id: int | None = None) -> np.ndarray:
         with self._lock:
             if start < 0 or stop > self._samples or stop <= start:
                 raise ValueError(f"Invalid segment [{start}:{stop}] for {self._samples} samples")
             pieces: list[np.ndarray] = []
+            selected_segments: set[int] = set()
             cursor = 0
-            for chunk in self._chunks:
+            for chunk, chunk_segment in zip(self._chunks, self._segment_ids):
                 chunk_stop = cursor + chunk.shape[1]
                 if chunk_stop <= start:
                     cursor = chunk_stop
@@ -116,7 +192,12 @@ class ContinuousRecorder:
                 local_start = max(0, start - cursor)
                 local_stop = min(chunk.shape[1], stop - cursor)
                 pieces.append(chunk[:, local_start:local_stop])
+                selected_segments.add(chunk_segment)
                 cursor = chunk_stop
+            if len(selected_segments) != 1 or (
+                segment_id is not None and selected_segments != {segment_id}
+            ):
+                raise ValueError("Trial crosses an EEG stream segment boundary")
             result = np.concatenate(pieces, axis=1)
             if result.shape[1] != stop - start:
                 raise RuntimeError("Recorder segment length mismatch")
@@ -150,22 +231,67 @@ def save_mi_recording(
     subject_id: str,
     session_id: str,
     configuration: dict[str, object],
+    segment_ids: np.ndarray | None = None,
+    discarded_trials: Sequence[dict[str, object]] = (),
+    recovery_stats: dict[str, object] | None = None,
+    recovery_events: Sequence[dict[str, object]] = (),
 ) -> Path:
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
+    backend = str(configuration.get("backend", "unspecified"))
+    source_kind = {
+        "brainflow": "hardware", "lsl": "lsl", "replay": "replay",
+        "synthetic": "synthetic", "synthetic_mi": "synthetic",
+    }.get(backend, "unspecified")
+    provenance = {
+        "kind": source_kind,
+        "source_kind": source_kind,
+        "backend": backend,
+        "label_source": configuration.get(
+            "label_source", "scripted_simulation" if backend == "synthetic_mi" else "unspecified"
+        ),
+        "human_mi_verified": False,
+    }
+    if source_kind == "replay":
+        provenance["source_recording"] = configuration.get("source_recording", "unspecified")
+        provenance["source_provenance"] = configuration.get("source_provenance", {})
+    completed = len(trials)
+    artifacts = sum(bool(trial.artifact) for trial in trials)
+    planned = int(configuration.get("planned_trials", completed + len(discarded_trials)))
     metadata = {
-        "format_version": 1,
+        "format_version": 3,
         "subject_id": subject_id,
         "session_id": session_id,
         "sample_rate": sample_rate,
         "channel_names": list(channel_names),
+        "units": "uV",
+        "reference": configuration.get("reference", "unspecified"),
+        "reference_location": configuration.get("reference_location", "unspecified"),
+        "bias_location": configuration.get("bias_location", "unspecified"),
+        "provenance": provenance,
+        "trial_summary": {
+            "planned": planned,
+            "completed": completed,
+            "usable": completed - artifacts,
+            "artifact_marked": artifacts,
+            "discarded": len(discarded_trials),
+            "unattempted": max(0, planned - completed - len(discarded_trials)),
+            "usable_definition": "completed trials without an operator artifact mark",
+        },
         "configuration": configuration,
         "trials": [asdict(trial) for trial in trials],
+        "discarded_trials": list(discarded_trials),
+        "recovery_stats": recovery_stats or {},
+        "recovery_events": list(recovery_events),
     }
+    segment_ids = np.zeros(np.asarray(timestamps).size, dtype=np.int64) if segment_ids is None else np.asarray(segment_ids, dtype=np.int64)
+    if segment_ids.shape != np.asarray(timestamps).shape:
+        raise ValueError("One segment ID is required per continuous EEG sample")
     np.savez_compressed(
         destination,
         continuous=np.asarray(continuous, dtype=np.float32),
         timestamps=np.asarray(timestamps, dtype=np.float64),
+        segment_ids=segment_ids,
         epochs=np.asarray(epochs, dtype=np.float32),
         labels=np.asarray(labels),
         artifact=np.asarray([trial.artifact for trial in trials], dtype=bool),

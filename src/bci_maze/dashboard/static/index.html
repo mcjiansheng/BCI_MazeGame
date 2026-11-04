@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>MindMaze · 实验控制台</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/app.css">
+  <link rel="stylesheet" href="/experiments.css">
+  <script defer src="/app.js"></script>
+  <script defer src="/experiments.js"></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">跳至监测内容</a>
+  <header class="app-header">
+    <div class="brand"><span class="brand-mark" aria-hidden="true">M<span>↗</span></span><div><h1>MindMaze <span>实验控制台</span></h1><p>LK-Mini-EEG16 · 运动想象与迷宫交互</p></div></div>
+    <nav aria-label="页面区域"><a href="#monitor">信号监测</a><a href="#workflow">实验流程</a><a href="#unity">游戏控制</a><a href="#experiments">子实验</a></nav>
+    <span class="pill" id="service-status" role="status">正在连接控制台</span>
+  </header>
+  <main id="main">
+    <div id="error-banner" class="notice error" role="alert" hidden><span id="error-message"></span><button type="button" id="dismiss-error" class="icon-button" aria-label="关闭错误提示">×</button></div>
+    <div class="workspace">
+      <aside class="panel source-panel" aria-labelledby="source-title">
+        <div class="section-label">01 / CONNECTION</div><h2 id="source-title">连接与监测</h2>
+        <p class="muted intro">选择数据来源，检查逐路波形和传输状态。</p>
+        <label for="monitor-purpose">监测用途</label><select id="monitor-purpose"><option value="signal">信号质量检查</option><option value="connection">连接监测</option></select>
+        <label for="wear-state">设备佩戴状态</label><select id="wear-state" aria-describedby="wear-state-hint"><option value="unknown">待确认</option><option value="worn">已佩戴</option><option value="unworn">未佩戴</option></select><p class="hint" id="wear-state-hint">按当前实际佩戴情况填写。</p>
+        <form id="source-form">
+          <fieldset id="source-fields">
+            <label for="backend">数据来源</label><select id="backend" name="backend"><option value="brainflow">真实设备 · Wi-Fi 直连</option><option value="lsl">OpenBCI GUI · LSL</option><option value="replay">已有记录 · NPZ 回放</option><option value="synthetic">仿真信号 · 界面演示</option></select>
+            <div id="source-type-note" class="source-note">设备数据 · 等待连接</div>
+            <div id="network-fields"><label for="ip-address">设备 IP</label><input id="ip-address" name="ip_address" value="192.168.4.1" required autocomplete="off" spellcheck="false"><label for="ip-port">端口</label><input id="ip-port" name="ip_port" type="number" min="1" max="65535" value="12345" required></div>
+            <label for="sample-rate">采样率</label><select id="sample-rate" name="sample_rate"><option value="250">250 Hz</option><option value="500">500 Hz</option><option value="1000">1000 Hz</option></select>
+            <div id="lsl-fields" hidden><label for="lsl-name">LSL 流名称（可选）</label><input id="lsl-name" name="lsl_name" autocomplete="off" placeholder="留空查找 EEG 流"></div>
+            <div id="replay-fields" hidden><label for="replay">回放记录</label><select id="replay" name="replay"><option value="">正在读取记录…</option></select></div>
+            <div id="recovery-fields"><label for="recovery-profile">连接恢复配置</label><select id="recovery-profile"><option value="standard">标准恢复</option><option value="fast">快速恢复（试测参数）</option></select><p class="hint" id="recovery-profile-hint">停流检测 3 s · 进程停止宽限 4 s · 首次重试间隔 0.5 s</p></div>
+          </fieldset>
+          <button class="button primary full-width" type="submit" id="start-monitor" disabled><span aria-hidden="true">▷</span> 开始监测</button>
+        </form>
+        <button class="button secondary full-width" type="button" id="stop-monitor" disabled><span aria-hidden="true">□</span> 停止监测</button>
+        <p class="hint" id="monitor-action-hint">监测窗口使用最近 5 秒数据，积累 2 秒后评估质量。</p>
+        <div class="divider"></div>
+        <div id="wearing-guidance"><h3>佩戴检查依据</h3><p class="muted">波形质量筛查综合幅度、平直线与 50 Hz 工频干扰，辅助排查电极接触、动作与环境干扰。</p>
+        <div class="capability"><span class="tiny-dot neutral"></span><span>阻抗检测：<strong>尚未接入</strong></span></div>
+        <p class="hint">电极接触确认还需阻抗测量与实际佩戴检查。</p></div>
+        <div id="connection-guidance" hidden><h3>数据传输监测</h3><p class="muted">当前模式统计数据传输与恢复；信号质量检查在对应监测模式中查看。</p><p class="hint">关注接收样本是否持续增长、数据新鲜度、采集器连接阶段和成功重连次数。</p></div>
+      </aside>
+
+      <section class="monitor-area" id="monitor" aria-labelledby="monitor-title">
+        <div class="monitor-heading"><div><div class="section-label">02 / LIVE SIGNAL</div><h2 id="monitor-title">信号监测</h2></div><div class="status-pair"><span class="pill source-pill" id="active-source">尚未采集</span><span class="pill" id="monitor-status" role="status">等待启动</span></div></div>
+        <div class="metrics" aria-label="采集统计">
+          <div><span class="metric-label">已接收样本</span><strong id="samples">—</strong><small id="elapsed">时长 —</small></div>
+          <div><span class="metric-label">采样率 / 通道</span><strong id="rate">—</strong><small id="channel-count">等待数据源</small></div>
+          <div><span class="metric-label">数据新鲜度</span><strong id="freshness">—</strong><small id="segment">连接段 —</small></div>
+          <div><span class="metric-label">断流 / 成功重连</span><strong id="recovery">— / —</strong><small>来自采集器状态</small></div>
+        </div>
+        <div class="signal-grid">
+          <section class="panel wave-panel" aria-labelledby="wave-title">
+            <div class="panel-heading"><h3 id="wave-title">多通道波形</h3><span class="small muted" id="wave-window">最近 5 秒</span></div>
+            <div class="wave-container"><canvas id="wave-canvas" role="img" aria-label="脑电波形，尚未开始监测"></canvas><div class="wave-empty" id="wave-empty"><span class="empty-wave" aria-hidden="true">∿</span><strong>等待脑电数据</strong><span>在左侧开始监测，或选择仿真信号体验界面。</span></div></div>
+            <p class="chart-caption" id="wave-caption">各路去中位数、独立纵向缩放 · 幅度指标见质量表</p>
+          </section>
+          <section class="panel quality-panel" aria-labelledby="quality-title">
+            <div class="panel-heading"><h3 id="quality-title">逐路质量</h3><span class="small" id="quality-count">等待评估</span></div>
+            <div id="quality-content">
+            <div class="quality-legend"><span class="quality-label good">● 良好</span><span class="quality-label warning">▲ 需调整</span><span class="quality-label bad">■ 异常</span></div>
+            <div class="table-scroll"><table><caption class="sr-only">各通道波形质量、峰峰值和工频干扰占比</caption><thead><tr><th scope="col">通道</th><th scope="col">状态</th><th scope="col">峰峰 μV</th><th scope="col">50 Hz</th></tr></thead><tbody id="quality-body"></tbody></table></div>
+            <details class="quality-details"><summary>查看通道完整指标</summary><label for="quality-channel" class="sr-only">选择详细指标通道</label><select id="quality-channel"></select><dl class="quality-detail-values"><div><dt>去中位数 RMS</dt><dd id="quality-rms">—</dd></div><div><dt>平直线比例</dt><dd id="quality-flat">—</dd></div><div><dt>有效值比例</dt><dd id="quality-finite">—</dd></div></dl></details>
+            </div>
+            <div id="connection-overview" hidden>
+              <p class="connection-notice">连接监测用于观察数据传输与恢复，佩戴情况按左侧独立状态记录。</p>
+              <div class="connection-stage"><span>采集器连接阶段</span><strong id="source-connection-state" role="status">等待状态</strong><small id="source-connection-code">—</small></div>
+              <dl class="connection-counters"><div><dt>连接尝试</dt><dd id="connection-attempts">—</dd></div><div><dt>成功重连</dt><dd id="connection-reconnects">—</dd></div><div><dt>数据中断</dt><dd id="connection-gaps">—</dd></div><div><dt>连接失败</dt><dd id="connection-failures">—</dd></div></dl>
+              <p class="hint" id="connection-profile-label">恢复配置：等待采集器参数</p>
+              <h4 class="connection-events-heading">最近恢复事件</h4><ol id="connection-events" class="connection-events" tabindex="0" aria-label="最近恢复事件"><li>开始监测后显示采集器事件。</li></ol>
+            </div>
+            <p id="quality-note" class="chart-caption">质量状态随数据更新；停止或断流后等待重新评估。</p>
+          </section>
+        </div>
+      </section>
+    </div>
+
+    <div class="bottom-grid">
+      <section class="panel workflow-panel" id="workflow" aria-labelledby="workflow-title">
+        <div class="panel-heading"><div><div class="section-label">03 / EXPERIMENT</div><h2 id="workflow-title">实验流程</h2></div><span class="pill" id="job-status" role="status">尚未启动任务</span></div>
+        <p class="muted workflow-intro">监测与实验任务依次运行，任务使用上方的数据源配置。采集时由独立提示窗口显示进度与质量，训练进展显示在日志中。</p>
+        <form id="job-form">
+          <fieldset id="job-fields">
+            <div class="field-pair"><div><label for="job-kind">实验步骤</label><select id="job-kind"><option value="collect">1 · 采集个人校准数据</option><option value="finetune">2 · SE-MHAF 个人微调</option><option value="train">2 · CSP + LDA 对照训练</option><option value="online">3 · 在线识别与游戏控制</option></select></div><div id="subject-field"><label for="subject">受试者编号</label><input id="subject" value="S01" required pattern="[A-Za-z0-9][A-Za-z0-9_\-]*" maxlength="64" autocomplete="off" title="以英文字母或数字开头，可使用下划线和连字符"></div></div>
+            <div id="collect-fields" class="field-pair"><div><label for="session">采集会话名称</label><input id="session" required pattern="[A-Za-z0-9][A-Za-z0-9_\-]*" maxlength="64" autocomplete="off" title="以英文字母或数字开头，可使用下划线和连字符"></div><div><label for="preset">采集方案</label><select id="preset"><option value="short">短轮 · 每类 10 次 / 2 组</option><option value="standard">标准 · 每类 20 次 / 4 组</option><option value="full">完整 · 每类 40 次 / 4 组</option></select></div></div>
+            <div id="training-fields" hidden><label for="recordings">选择训练记录</label><select id="recordings" multiple size="4" aria-describedby="recordings-hint"></select><p class="hint" id="recordings-hint">按住 Ctrl 多选同一受试者的记录，再用下方箭头调整为采集时间顺序。模型按此顺序读取并划分评估数据。</p><div class="selected-records-heading">实际输入顺序</div><ol id="recording-order" class="recording-order" aria-label="训练记录输入顺序"></ol><p id="recording-order-empty" class="hint">选择记录后可调整输入顺序。</p></div>
+            <div id="online-fields" hidden><label for="model">在线模型</label><select id="model"></select><label class="checkbox-label"><input type="checkbox" id="unity-control">将识别结果发送至 Unity 游戏</label></div>
+          </fieldset>
+          <p class="hint" id="job-description">打开独立的中文提示窗口，按动作提示完成运动想象采集。</p>
+          <div class="button-row"><button class="button primary" id="start-job" type="submit" disabled>启动采集</button><button class="button secondary" id="stop-job" type="button" disabled>停止任务</button><button class="button text-button" id="refresh-files" type="button">刷新文件列表</button></div>
+        </form>
+        <p class="job-output" id="job-output" hidden></p>
+        <div class="log-heading"><h3>任务日志</h3><span class="muted small">最近输出 · 自动更新</span></div><pre class="log-output" id="job-log" tabindex="0" aria-label="任务运行日志">启动实验后，这里将显示脚本输出与结果路径。</pre>
+      </section>
+
+      <section class="panel unity-panel" id="unity" aria-labelledby="unity-title">
+        <div class="section-label">04 / MAZE</div><div class="panel-heading"><h2 id="unity-title">Unity 游戏</h2><span class="pill" id="unity-status">等待查询</span></div>
+        <p class="muted">在 Unity 中打开迷宫场景并进入 Play，再查询游戏状态。</p>
+        <div class="field-pair unity-address"><div><label for="unity-host">地址</label><input id="unity-host" value="127.0.0.1" autocomplete="off"></div><div><label for="unity-port">端口</label><input id="unity-port" type="number" min="1" max="65535" value="7777"></div></div>
+        <button class="button secondary full-width" id="query-unity" type="button" data-command="status">查询游戏状态</button>
+        <dl class="unity-metrics"><div><dt>导航状态</dt><dd id="unity-phase">—</dd></div><div><dt>所在位置</dt><dd id="unity-position">—</dd></div><div><dt>已行走步数</dt><dd id="unity-steps">—</dd></div></dl>
+        <div class="button-row unity-controls"><button class="button secondary" type="button" data-command="pause">暂停</button><button class="button secondary" type="button" data-command="resume">继续</button></div>
+        <div class="button-row unity-controls"><button class="button secondary" type="button" data-command="left">← 左转</button><button class="button secondary" type="button" data-command="uturn">掉头</button><button class="button secondary" type="button" data-command="right">右转 →</button></div>
+        <p class="hint" id="unity-hint">手动指令以游戏回执为准。在线控制运行期间可查询和暂停。</p>
+      </section>
+    </div>
+    <section class="panel experiments-panel" id="experiments" aria-labelledby="experiments-title">
+      <div class="panel-heading"><div><div class="section-label">05 / SUB-EXPERIMENTS</div><h2 id="experiments-title">动作、想象与模型验证</h2></div><span class="pill" id="experiment-job-status" role="status">准备子实验</span></div>
+      <p class="muted experiment-intro">分别检查真实动作、运动想象的信号变化，再用独立分组评价分类模型。</p>
+      <div class="experiment-tabs" role="tablist" aria-label="子实验选择"><button id="experiment-tab-motor" type="button" role="tab" aria-selected="true" aria-controls="experiment-setup" data-experiment="motor"><span>01</span> 真实握拳对照</button><button id="experiment-tab-imagery" type="button" role="tab" aria-selected="false" aria-controls="experiment-setup" tabindex="-1" data-experiment="imagery"><span>02</span> 运动想象分析</button><button id="experiment-tab-benchmark" type="button" role="tab" aria-selected="false" aria-controls="experiment-setup" tabindex="-1" data-experiment="benchmark"><span>03</span> 基线模型验证</button></div>
+      <div id="experiment-error" class="notice error" role="alert" hidden></div>
+      <div class="experiment-workspace" id="experiment-setup" role="tabpanel" aria-labelledby="experiment-tab-motor">
+        <form id="experiment-form">
+          <h3 id="experiment-step-title">真实左右握拳对照</h3><p class="muted" id="experiment-description">按提示完成真实左右握拳，记录动作任务与静息基线。任务标签记录为真实动作，与想象记录分开分析。</p>
+          <fieldset id="experiment-fields">
+            <div class="field-pair"><div><label for="experiment-subject">受试者编号</label><input id="experiment-subject" value="S01" required pattern="[A-Za-z0-9][A-Za-z0-9_\-]*" maxlength="64" autocomplete="off"></div><div><label for="experiment-session">实验会话名称</label><input id="experiment-session" required pattern="[A-Za-z0-9][A-Za-z0-9_\-]*" maxlength="64" autocomplete="off"></div></div>
+            <div class="field-pair" id="experiment-collection-fields"><div><label for="experiment-trials">每类试次数</label><input id="experiment-trials" type="number" value="10" min="4" max="80" step="1" required></div><div><label for="experiment-blocks">采集分组数</label><input id="experiment-blocks" type="number" value="2" min="2" max="8" step="1" required></div></div>
+            <label for="experiment-recordings">已有记录（用于分析）</label><select id="experiment-recordings" multiple size="4" aria-describedby="experiment-recordings-hint"></select><p class="hint" id="experiment-recordings-hint">按住 Ctrl 多选同一受试者、同一任务的记录。采集按钮使用左侧配置的数据来源。</p>
+            <div class="field-pair" id="experiment-validation-fields" hidden><div><label for="experiment-split">独立评价划分</label><select id="experiment-split"><option value="auto">自动选择会话 / 分组</option><option value="session">按会话划分</option><option value="block">按采集分组划分</option></select></div><div><label for="experiment-permutations">标签置乱次数</label><input id="experiment-permutations" type="number" min="5" max="200" step="1" value="30" required></div></div>
+          </fieldset>
+          <p class="hint" id="experiment-source">采集来源：等待控制台配置</p>
+          <div class="button-row"><button class="button primary" type="button" id="experiment-collect" disabled>开始提示采集</button><button class="button secondary" type="button" id="experiment-analyze" disabled>分析所选记录</button><button class="button secondary" type="button" id="experiment-demo" disabled>运行仿真演示</button><button class="button secondary" type="button" id="experiment-stop" disabled>停止子实验</button></div>
+          <p class="hint" id="experiment-action-hint">演示使用 DEMO_EXPERIMENT 的仿真生理数据，在本机生成信号分析报告。</p>
+        </form>
+        <aside class="experiment-cue" aria-labelledby="experiment-cue-title"><div class="panel-heading"><h3 id="experiment-cue-title">采集提示与进度</h3><span class="pill" id="experiment-phase">等待采集</span></div><div class="experiment-cue-symbol" id="experiment-cue-symbol" aria-hidden="true">＋</div><strong id="experiment-cue-text" role="status">采集开始后显示任务提示</strong><div class="experiment-progress"><span id="experiment-trial-progress">有效 — / 目标 —</span><span id="experiment-countdown">预计剩余 —</span></div><p class="hint experiment-attempt-note" id="experiment-attempt-note">等待采集阶段事件。</p><p class="hint">提示依据采集脚本的阶段事件更新；动作时机以独立提示窗口为准。</p><details class="experiment-log-details"><summary>查看子实验输出</summary><pre id="experiment-log" tabindex="0" aria-label="子实验运行输出">等待子实验任务。</pre></details></aside>
+      </div>
+      <div class="experiment-reports-header"><div><h3>分析报告</h3><p class="muted">查看已保存报告，或等待当前子实验完成后自动载入。</p></div><button type="button" class="button text-button" id="experiment-refresh">刷新记录与报告</button></div>
+      <div class="experiment-report-picker"><label for="experiment-report-select">已有报告</label><select id="experiment-report-select"><option value="">正在读取报告列表…</option></select><button type="button" class="button secondary" id="experiment-open-report">查看报告</button></div>
+      <p class="experiment-empty" id="experiment-report-empty" role="status">完成采集分析或运行仿真演示后，可查看时频图、头皮分布和分组评价结果。</p>
+      <article id="experiment-report" class="experiment-report" hidden aria-labelledby="experiment-report-title">
+        <div class="panel-heading"><div><h3 id="experiment-report-title">实验报告</h3><p class="muted" id="experiment-report-path"></p></div><span class="pill" id="experiment-report-source"></span></div>
+        <div class="experiment-report-facts" id="experiment-report-facts"></div><section id="experiment-collection-summary" class="experiment-collection-summary" aria-labelledby="experiment-collection-summary-title" hidden><h4 id="experiment-collection-summary-title">采集结果</h4><div class="experiment-collection-metrics" id="experiment-collection-metrics"></div><p class="hint" id="experiment-collection-outcome"></p></section><p class="experiment-recording-path" id="experiment-recording-path" hidden></p><p class="hint" id="experiment-exclusions"></p>
+        <ul class="experiment-report-notes" id="experiment-report-notes"></ul>
+        <section class="experiment-result-section" aria-labelledby="experiment-erd-title"><h4 id="experiment-erd-title">中央区基线与任务功率</h4><p class="hint">ERD / ERS 为任务相对基线的功率变化：负值表示下降，正值表示上升。下表列出 C3、Cz、C4；频带定义见报告方法。</p><div class="experiment-table-wrap" tabindex="0" aria-label="中央区功率比较表"><table><thead><tr><th scope="col">任务</th><th scope="col">通道</th><th scope="col">频带</th><th scope="col">基线功率（µV²）</th><th scope="col">任务功率（µV²）</th><th scope="col">变化</th></tr></thead><tbody id="experiment-erd-body"></tbody></table></div><p class="hint" id="experiment-erd-empty" hidden></p></section>
+        <section class="experiment-result-section" aria-labelledby="experiment-figures-title"><h4 id="experiment-figures-title">信号分析图</h4><p class="hint">点击图像可在新标签页放大查看。时频、头皮分布与带符号 r² 展示所选数据的变化及效应。</p><div id="experiment-figures" class="experiment-figures"></div></section>
+        <section class="experiment-result-section" aria-labelledby="experiment-benchmark-title"><h4 id="experiment-benchmark-title">CSP + LDA 分组验证</h4><p id="experiment-benchmark-empty" class="hint">本报告未执行基线模型验证。</p><div id="experiment-benchmark" hidden><div class="experiment-benchmark-metrics" id="experiment-benchmark-metrics"></div><p class="hint" id="experiment-split-summary"></p><div class="experiment-benchmark-tables"><div><h5>逐折独立评价</h5><div class="experiment-table-wrap" tabindex="0" aria-label="逐折评价表"><table><thead><tr><th scope="col">折</th><th scope="col">训练组</th><th scope="col">测试组</th><th scope="col">BA</th></tr></thead><tbody id="experiment-folds"></tbody></table></div></div><div><h5>混淆矩阵</h5><p class="hint">行：真实类别 · 列：预测类别</p><div class="experiment-table-wrap"><table id="experiment-confusion"></table></div></div></div><div class="experiment-deep-comparison"><h5>同一划分的深度模型对照</h5><label for="experiment-deep-ba">深度模型 BA（%，手工输入）</label><input id="experiment-deep-ba" type="number" min="0" max="100" step="0.01" placeholder="输入同一评价划分的结果"><label class="checkbox-label"><input type="checkbox" id="experiment-same-split">已使用与本报告相同的受试者、评价划分和指标</label><p class="hint">此值保留在当前页面；请根据同一划分的实际结果填写。</p><p id="experiment-deep-result" class="experiment-comparison-result" role="status">输入结果并确认评价条件后显示差值。</p></div></div></section>
+        <details class="experiment-methods"><summary>查看实验方法与参数</summary><pre id="experiment-methods" tabindex="0"></pre></details>
+      </article>
+    </section>
+    <footer>MindMaze / 本地实验工作台 <span>信号监测 → 个人校准 → 模型训练 → 迷宫交互</span></footer>
+  </main>
+</body>
+</html>

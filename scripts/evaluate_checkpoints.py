@@ -20,14 +20,15 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from bci_maze.models import build_model
-from bci_maze.training import evaluate, prepare_subject_data
+from bci_maze.preprocessing import load_processed_session
+from bci_maze.training import evaluate, prepare_evaluation_session, prepare_subject_data
 
 
 CHECKPOINT_DIRS = {
     "bcic2a": {
-        "eeg_conformer": "eeg_conformer",
-        "fbcnet": "fbcnet",
-        "se_mhaf_conformer": "se_mhaf_conformer",
+        "eeg_conformer": "bcic2a/eeg_conformer",
+        "fbcnet": "bcic2a/fbcnet",
+        "se_mhaf_conformer": "bcic2a/se_mhaf_conformer",
         "se_mhaf_conformer_v2": "bcic2a/se_mhaf_conformer_v2",
         "se_mhaf_conformer_final": "bcic2a/se_mhaf_conformer_final",
     },
@@ -51,15 +52,30 @@ def evaluate_subject(dataset: str, model_key: str, subject: int, device: torch.d
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     model_name = str(checkpoint.get("model_name", model_key))
 
-    data = prepare_subject_data(
-        ROOT / f"data/processed/{dataset}",
-        subject=subject,
-        model_name=model_name,
-        validation_size=0.2,
-        seed=42 + subject,
-        exclude_artifacts=True,
-        file_prefix=prefix,
-    )
+    config = checkpoint.get("config", {})
+    exclude_artifacts = bool(config.get("exclude_artifacts", True))
+    processed_dir = ROOT / f"data/processed/{dataset}"
+    if checkpoint.get("norm_stats") is not None:
+        session = load_processed_session(processed_dir, subject, "E", file_prefix=prefix)
+        test_x, test_y = prepare_evaluation_session(
+            session,
+            model_name,
+            checkpoint["norm_stats"],
+            exclude_artifacts=exclude_artifacts,
+        )
+        data = {"test_x": test_x, "test_y": test_y}
+    else:
+        # Legacy checkpoints did not persist normalization statistics. Rebuild
+        # them from their own training configuration as a compatibility path.
+        data = prepare_subject_data(
+            processed_dir,
+            subject=subject,
+            model_name=model_name,
+            validation_size=float(config.get("validation_size", 0.2)),
+            seed=int(config.get("seed", 42)) + subject,
+            exclude_artifacts=exclude_artifacts,
+            file_prefix=prefix,
+        )
     test_loader = DataLoader(
         TensorDataset(torch.from_numpy(data["test_x"]), torch.from_numpy(data["test_y"])),
         batch_size=64,

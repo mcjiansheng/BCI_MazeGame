@@ -63,6 +63,14 @@ def test_load_label_map_rejects_missing_command_entry(tmp_path):
         load_label_map(path)
 
 
+def test_first_person_label_map_supports_optional_uturn():
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[1] / "configs/label_maps/bcic2a_relative.json"
+    label_map = load_label_map(path)
+    assert label_map.commands == ("left", "right", "uturn", None)
+
+
 def test_causal_bandpass_matches_one_shot_causal_filter():
     rng = np.random.default_rng(0)
     n_channels, n_times = 3, 500

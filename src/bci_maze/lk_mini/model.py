@@ -124,6 +124,8 @@ def _validate_epochs(x: np.ndarray) -> np.ndarray:
         raise ValueError("epochs must be trials x channels x samples")
     if epochs.shape[0] == 0 or epochs.shape[1] < 2 or epochs.shape[2] < 32:
         raise ValueError(f"Invalid epoch shape: {epochs.shape}")
+    if not np.isfinite(epochs).all():
+        raise ValueError("EEG epochs contain NaN or infinity; exclude the damaged trials before training")
     return epochs
 
 
@@ -169,7 +171,7 @@ class MIModelBundle:
             raise ValueError(
                 f"Model requires (*, {len(self.channel_names)}, {expected_samples}), got {values.shape}"
             )
-        return values
+        return _validate_epochs(values)
 
     def predict_proba(self, epoch: np.ndarray, sample_rate: int, channel_names: Sequence[str]) -> np.ndarray:
         values = self.validate_input(epoch, sample_rate, channel_names)
@@ -318,6 +320,7 @@ def train_subject_model(
         "subject_id": subject_id,
         "classes": list(classes),
         "channel_names": list(channel_names),
+        "channel_count": len(channel_names),
         "config": asdict(config),
         "validation": validation_kind,
         "n_trials": int(len(targets)),

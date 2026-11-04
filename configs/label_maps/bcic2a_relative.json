@@ -1,0 +1,11 @@
+{
+  "dataset": "bcic2a",
+  "description": "First-person maze: relative turns, optional feet U-turn; tongue sends no command. Walking is automatic.",
+  "labels": ["left_hand", "right_hand", "feet", "tongue"],
+  "commands": {
+    "left_hand": "left",
+    "right_hand": "right",
+    "feet": "uturn",
+    "tongue": null
+  }
+}

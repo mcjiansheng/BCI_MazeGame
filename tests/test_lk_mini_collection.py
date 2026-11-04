@@ -30,10 +30,15 @@ def test_collection_saves_completed_trials_before_reraising_stream_error(
         channel_names = ("C3", "C4")
 
     class FakeDisplay:
+        aborted = False
+
         def __init__(self, _fullscreen):
             self.closed = False
 
         def begin_trial(self):
+            pass
+
+        def set_plan(self, _text):
             pass
 
         def consume_artifact(self):
@@ -47,6 +52,8 @@ def test_collection_saves_completed_trials_before_reraising_stream_error(
 
     class FailingRecorder:
         error = None
+        recovering = False
+        segment_id = 0
 
         def __init__(self, source):
             self.source = source
@@ -65,19 +72,27 @@ def test_collection_saves_completed_trials_before_reraising_stream_error(
         def recent(self, samples):
             return np.zeros((2, samples))
 
-        def wait_for_samples(self, _stop_sample, timeout):
+        def cursor(self):
+            return self.sample_count, self.segment_id
+
+        def wait_for_samples(self, _stop_sample, timeout, *, segment_id=None):
             assert timeout == 2.0
+            assert segment_id == self.segment_id
             if self.completed:
                 raise RuntimeError("device disconnected")
             self.completed += 1
             return True
 
-        def segment(self, start, stop):
+        def segment(self, start, stop, *, segment_id=None):
+            assert segment_id == self.segment_id
             return np.zeros((2, stop - start))
 
         def snapshot(self):
             samples = self.source.sample_rate * 2
             return np.zeros((2, samples)), np.arange(samples) / self.source.sample_rate
+
+        def snapshot_segment_ids(self):
+            return np.zeros(self.source.sample_rate * 2, dtype=np.int64)
 
     output = tmp_path / "partial.npz"
     fake_source = FakeSource()

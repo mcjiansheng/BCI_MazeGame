@@ -8,6 +8,8 @@ from typing import Sequence
 
 import numpy as np
 
+from .quality import assess_signal_quality
+
 
 def validate_stream_metadata(
     sample_rate: int,
@@ -130,3 +132,41 @@ class ProbabilitySmoother:
             accepted=accepted,
             reason=reason,
         )
+
+
+@dataclass(frozen=True)
+class OnlineWindowResult:
+    decision: OnlineDecision
+    bad_channels: tuple[str, ...]
+
+
+def classify_mi_window(
+    bundle,
+    smoother: ProbabilitySmoother,
+    window: np.ndarray,
+    sample_rate: int,
+    channel_names: Sequence[str],
+) -> OnlineWindowResult:
+    """Apply the production quality gate, model and smoothing to one window."""
+    names = tuple(channel_names)
+    quality = assess_signal_quality(window, sample_rate)
+    bad_channels = tuple(
+        name for name, item in zip(names, quality) if item.status != "good"
+    )
+    if bad_channels:
+        smoother.reset()
+        return OnlineWindowResult(
+            decision=OnlineDecision(
+                label="unknown",
+                confidence=0.0,
+                probabilities={name: 0.0 for name in bundle.classes},
+                accepted=False,
+                reason="bad_signal",
+            ),
+            bad_channels=bad_channels,
+        )
+    probabilities = bundle.predict_proba(window, sample_rate, names)[0]
+    return OnlineWindowResult(
+        decision=smoother.update(probabilities),
+        bad_channels=(),
+    )

@@ -1,9 +1,11 @@
 """Shared pytest configuration for predictable CPU resource use."""
 
-import torch
+import importlib.util
 
 
 def pytest_sessionstart(session):
     """Avoid severe OpenMP oversubscription when multiple test runs overlap."""
 
-    torch.set_num_threads(1)
+    if importlib.util.find_spec("torch") is not None:
+        import torch
+        torch.set_num_threads(1)

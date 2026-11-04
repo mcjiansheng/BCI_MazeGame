@@ -1,406 +1,304 @@
 using System;
 using System.Collections.Generic;
-using System.Threading;
 using UnityEngine;
-#if UNITY_EDITOR
-using UnityEditor;
-#endif
 
-/// <summary>
-/// Generates and runs a top-down maze.  The maze uses iterative DFS with a
-/// one-cell wall between passages, as described in the project documentation.
-/// </summary>
+/// <summary>Continuous first-person motion with relative BCI turns on a DFS grid.</summary>
 [DisallowMultipleComponent]
 public sealed class MazeGameController : MonoBehaviour
 {
     public static MazeGameController Instance { get; private set; }
-    private static SynchronizationContext mainThreadContext;
-
+    public enum TravelState { Moving, Turning, Junction, DeadEnd, Complete }
     [Header("Maze")]
-    [Range(21, 101)] public int mazeWidth = 61;
-    [Range(21, 101)] public int mazeHeight = 61;
-    [Min(0.05f)] public float moveCooldownSeconds = 0.12f;
+    [Range(7, 61)] public int mazeWidth = 15;
+    [Range(7, 61)] public int mazeHeight = 15;
     public bool useFixedSeed;
-    public int fixedSeed = 20260723;
+    public int fixedSeed = 20260920;
+    [Header("First person")]
+    [Min(1f)] public float cellSize = 2.8f;
+    [Min(0.1f)] public float moveSpeed = 2.6f;
+    [Min(0.05f)] public float turnSeconds = 0.45f;
+    [Range(60f, 100f)] public float fieldOfView = 78f;
+    public float eyeHeight = 1.6f;
+    [Header("Junctions")]
+    [Min(0f)] public float junctionWaitSeconds = 4f;
+    public bool autoUTurnAtDeadEnd = true;
+    [Min(0f)] public float deadEndWaitSeconds = 2f;
+    public bool showMinimap = true;
 
-    [Header("Colours")]
-    public Color wallColor = new Color(0.07f, 0.12f, 0.22f);
-    public Color floorColor = new Color(0.82f, 0.88f, 0.93f);
-    public Color startColor = new Color(0.15f, 0.72f, 0.38f);
-    public Color goalColor = new Color(0.90f, 0.24f, 0.28f);
-    public Color playerColor = new Color(1.00f, 0.78f, 0.10f);
-
-    [Header("Camera")]
-    [Tooltip("Keep the player centred while moving through the maze.")]
-    public bool followPlayerCamera = true;
-    [Min(3f)] public float playerViewSize = 9f;
-
+    public TravelState State { get; private set; }
+    public Vector2Int PlayerCell { get; private set; }
+    public Vector2Int GoalCell { get; private set; }
+    public int Heading { get; private set; }
+    public int Steps { get; private set; }
+    public int Turns { get; private set; }
+    public int MazeGeneration { get; private set; }
+    public bool Paused { get; private set; }
+    public float ElapsedSeconds { get; private set; }
+    public float DecisionRemaining => State == TravelState.Junction || State == TravelState.DeadEnd
+        ? Mathf.Max(0, (State == TravelState.DeadEnd ? deadEndWaitSeconds : junctionWaitSeconds) - decisionElapsed) : 0;
+    public string PendingTurn { get; private set; } = "";
+    public string Hint { get; private set; } = "";
+    public Texture2D Minimap { get; private set; }
+    public bool CanLeft => IsWalkable(PlayerCell + Directions[(Heading + 3) % 4]);
+    public bool CanRight => IsWalkable(PlayerCell + Directions[(Heading + 1) % 4]);
+    public bool CanForward => IsWalkable(PlayerCell + Directions[Heading]);
+    public bool CanUTurn => IsWalkable(PlayerCell + Directions[(Heading + 2) % 4]);
+    public string HeadingName => new[] { "N", "E", "S", "W" }[Heading];
+    // Grid +Y is world +Z; heading indices rotate clockwise.
+    public static readonly Vector2Int[] Directions = {
+        Vector2Int.up, Vector2Int.right, Vector2Int.down, Vector2Int.left
+    };
     private bool[,] walkable;
-    private Vector2Int startCell;
-    private Vector2Int goalCell;
-    private Vector2Int playerCell;
-    private SpriteRenderer mapRenderer;
-    private SpriteRenderer playerRenderer;
-    private Texture2D mazeTexture;
-    private float lastMoveTime = -999f;
-    private bool hasWon;
-    private int steps;
-    private string status = "Generating maze…";
-    private Camera gameCamera;
-    private readonly object mazeStateLock = new object();
-    private bool pendingExternalVisualUpdate;
-
-    private static readonly Vector2Int[] CarveDirections =
-    {
-        new Vector2Int(2, 0),
-        new Vector2Int(-2, 0),
-        new Vector2Int(0, 2),
-        new Vector2Int(0, -2)
-    };
-
-    private static readonly Vector2Int[] MoveDirections =
-    {
-        Vector2Int.up,
-        Vector2Int.down,
-        Vector2Int.left,
-        Vector2Int.right
-    };
+    private Camera view;
+    private MazeWorldRenderer world;
+    private Vector2Int destination;
+    private Quaternion turnFrom, turnTo;
+    private float turnElapsed, decisionElapsed;
+    private IMECompositionMode previousImeMode;
 
     private void Awake()
     {
         Instance = this;
-        mainThreadContext = SynchronizationContext.Current;
+        Application.runInBackground = true;
+        previousImeMode = Input.imeCompositionMode;
+        Input.imeCompositionMode = IMECompositionMode.Off;
     }
-
-    private void OnEnable()
-    {
-        // Also register after an editor/domain reload, where Awake may not run again
-        // for an already-active scene object.
-        Instance = this;
-        mainThreadContext = SynchronizationContext.Current;
-#if UNITY_EDITOR
-        EditorApplication.update -= EditorVisualSync;
-        EditorApplication.update += EditorVisualSync;
-        EditorApplication.delayCall -= EnsureMazeInitialized;
-        EditorApplication.delayCall += EnsureMazeInitialized;
-#endif
-    }
-
-    private void OnDisable()
-    {
-#if UNITY_EDITOR
-        EditorApplication.update -= EditorVisualSync;
-        EditorApplication.delayCall -= EnsureMazeInitialized;
-#endif
-    }
-
-#if UNITY_EDITOR
-    // The Unity Editor may remain in a play-mode transition while its MCP bridge
-    // reconnects. This editor-main-thread callback keeps externally requested
-    // movement visually synchronized during that short transition as well.
-    private void EditorVisualSync()
-    {
-        SynchronizeExternalVisuals();
-        if (followPlayerCamera) UpdateCameraPosition();
-    }
-
-    private void EnsureMazeInitialized()
-    {
-        if (Application.isPlaying && walkable == null) GenerateMaze();
-    }
-#endif
-
     private void Start()
     {
+        world = gameObject.AddComponent<MazeWorldRenderer>();
+        gameObject.AddComponent<MazeHud>();
         GenerateMaze();
+    }
+
+    public void GenerateMaze()
+    {
+        MazeGeneration++;
+        mazeWidth = Mathf.Clamp(mazeWidth | 1, 7, 61);
+        mazeHeight = Mathf.Clamp(mazeHeight | 1, 7, 61);
+        walkable = new bool[mazeWidth, mazeHeight];
+        var random = useFixedSeed ? new System.Random(fixedSeed) : new System.Random();
+        var stack = new Stack<Vector2Int>();
+        var start = new Vector2Int(1, 1);
+        stack.Push(start);
+        walkable[1, 1] = true;
+        while (stack.Count > 0)
+        {
+            var current = stack.Peek();
+            var candidates = new List<Vector2Int>();
+            foreach (var direction in Directions)
+            {
+                var next = current + direction * 2;
+                if (next.x > 0 && next.y > 0 && next.x < mazeWidth - 1 && next.y < mazeHeight - 1
+                    && !walkable[next.x, next.y]) candidates.Add(direction);
+            }
+            if (candidates.Count == 0) { stack.Pop(); continue; }
+            var chosen = candidates[random.Next(candidates.Count)];
+            var nextCell = current + chosen * 2;
+            walkable[current.x + chosen.x, current.y + chosen.y] = true;
+            walkable[nextCell.x, nextCell.y] = true;
+            stack.Push(nextCell);
+        }
+        PlayerCell = start;
+        GoalCell = new Vector2Int(mazeWidth - 2, mazeHeight - 2);
+        Heading = IsWalkable(start + Directions[0]) ? 0 : 1;
+        Steps = Turns = 0;
+        ElapsedSeconds = 0;
+        decisionElapsed = 0;
+        Paused = false;
+        PendingTurn = Hint = "";
+        if (world == null) world = GetComponent<MazeWorldRenderer>();
+        world.Build(this);
+        BuildMinimap();
+        view = Camera.main;
+        view.orthographic = false;
+        view.fieldOfView = fieldOfView;
+        view.nearClipPlane = 0.05f;
+        view.farClipPlane = 250f;
+        view.clearFlags = CameraClearFlags.SolidColor;
+        view.backgroundColor = new Color(0.66f, 0.82f, 0.89f);
+        view.transform.SetPositionAndRotation(EyePosition(start), Quaternion.Euler(0, Heading * 90, 0));
+        BeginMove();
     }
 
     private void Update()
     {
-        if (Input.GetKeyDown(KeyCode.W) || Input.GetKeyDown(KeyCode.UpArrow)) TryMove("up");
-        if (Input.GetKeyDown(KeyCode.S) || Input.GetKeyDown(KeyCode.DownArrow)) TryMove("down");
         if (Input.GetKeyDown(KeyCode.A) || Input.GetKeyDown(KeyCode.LeftArrow)) TryMove("left");
         if (Input.GetKeyDown(KeyCode.D) || Input.GetKeyDown(KeyCode.RightArrow)) TryMove("right");
+        if (Input.GetKeyDown(KeyCode.S) || Input.GetKeyDown(KeyCode.DownArrow)) TryMove("uturn");
+        if (Input.GetKeyDown(KeyCode.W) || Input.GetKeyDown(KeyCode.UpArrow)) TryMove("forward");
+        if (Input.GetKeyDown(KeyCode.Space)) TogglePause();
         if (Input.GetKeyDown(KeyCode.R)) GenerateMaze();
-        if (Input.GetKeyDown(KeyCode.H)) ShowHintInConsole();
-        if (Input.GetKeyDown(KeyCode.V)) ToggleCameraView();
+        if (Input.GetKeyDown(KeyCode.M) || Input.GetKeyDown(KeyCode.V)) showMinimap = !showMinimap;
+        if (Input.GetKeyDown(KeyCode.H)) ShowHint();
+        TickNavigation(Time.deltaTime);
     }
 
-    private void LateUpdate()
+    public void TickNavigation(float deltaTime)
     {
-        SynchronizeExternalVisuals();
-        if (followPlayerCamera) UpdateCameraPosition();
-    }
-
-    private void SynchronizeExternalVisuals()
-    {
-        bool updateVisual;
-        Vector2Int externalPlayerCell;
-        lock (mazeStateLock)
+        if (walkable == null || Paused || State == TravelState.Complete) return;
+        ElapsedSeconds += deltaTime;
+        if (State == TravelState.Moving)
         {
-            updateVisual = pendingExternalVisualUpdate;
-            externalPlayerCell = playerCell;
-            pendingExternalVisualUpdate = false;
-        }
-        if (updateVisual && playerRenderer != null)
-            playerRenderer.transform.position = GridToWorld(externalPlayerCell);
-        if (updateVisual && followPlayerCamera) UpdateCameraPosition();
-    }
-
-    /// <summary>Creates a new connected perfect maze and resets the player.</summary>
-    public void GenerateMaze()
-    {
-        mazeWidth = MakeOdd(mazeWidth);
-        mazeHeight = MakeOdd(mazeHeight);
-        walkable = new bool[mazeWidth, mazeHeight];
-
-        var random = useFixedSeed ? new System.Random(fixedSeed) : new System.Random();
-        var stack = new Stack<Vector2Int>();
-        startCell = new Vector2Int(1, 1);
-        stack.Push(startCell);
-        walkable[startCell.x, startCell.y] = true;
-
-        while (stack.Count > 0)
-        {
-            Vector2Int current = stack.Peek();
-            var candidates = new List<Vector2Int>(4);
-            foreach (Vector2Int direction in CarveDirections)
+            view.transform.position = Vector3.MoveTowards(view.transform.position, EyePosition(destination), moveSpeed * deltaTime);
+            if (Vector3.Distance(view.transform.position, EyePosition(destination)) < 0.001f)
             {
-                Vector2Int next = current + direction;
-                if (IsInterior(next) && !walkable[next.x, next.y]) candidates.Add(direction);
+                PlayerCell = destination;
+                Steps++;
+                Arrive();
             }
-
-            if (candidates.Count == 0)
-            {
-                stack.Pop();
-                continue;
-            }
-
-            Vector2Int chosen = candidates[random.Next(candidates.Count)];
-            Vector2Int passage = current + chosen / 2;
-            Vector2Int nextCell = current + chosen;
-            walkable[passage.x, passage.y] = true;
-            walkable[nextCell.x, nextCell.y] = true;
-            stack.Push(nextCell);
         }
-
-        goalCell = new Vector2Int(mazeWidth - 2, mazeHeight - 2);
-        playerCell = startCell;
-        hasWon = false;
-        steps = 0;
-        lastMoveTime = -999f;
-        BuildVisuals();
-        ConfigureCamera();
-        status = "Reach the red exit.";
-        Debug.Log($"Generated {mazeWidth}×{mazeHeight} DFS maze. Start: {startCell}; goal: {goalCell}.");
-    }
-
-    /// <summary>
-    /// Main-thread command endpoint for UI, BCI bridges and external adapters.
-    /// Supported values: up/down/left/right, forward/backward, w/a/s/d.
-    /// </summary>
-    public bool TryMove(string command)
-    {
-        lock (mazeStateLock)
+        else if (State == TravelState.Turning)
         {
-            if (Time.unscaledTime - lastMoveTime < moveCooldownSeconds) return false;
-            return MoveInternal(command, true);
-        }
-    }
-
-    /// <summary>
-    /// Thread-safe movement endpoint for network adapters. It updates the game state
-    /// immediately, then LateUpdate synchronizes the rendered character on Unity's main thread.
-    /// </summary>
-    public bool TryMoveFromExternal(string command)
-    {
-        lock (mazeStateLock) return MoveInternal(command, false);
-    }
-
-    private bool MoveInternal(string command, bool updateVisualImmediately)
-    {
-        if (walkable == null || hasWon || !TryParseDirection(command, out Vector2Int direction)) return false;
-        Vector2Int next = playerCell + direction;
-        if (!IsWalkable(next))
-        {
-            status = "Wall blocked the move.";
-            return false;
-        }
-
-        playerCell = next;
-        steps++;
-        if (updateVisualImmediately)
-        {
-            lastMoveTime = Time.unscaledTime;
-            if (playerRenderer != null) playerRenderer.transform.position = GridToWorld(playerCell);
-            UpdateCameraPosition();
+            turnElapsed += deltaTime;
+            float t = Mathf.Clamp01(turnElapsed / Mathf.Max(0.05f, turnSeconds));
+            view.transform.rotation = Quaternion.Slerp(turnFrom, turnTo, t * t * (3 - 2 * t));
+            if (t >= 1) BeginMove();
         }
         else
         {
-            pendingExternalVisualUpdate = true;
-            QueueExternalVisualSync();
+            if (ApplyPendingTurn()) return;
+            decisionElapsed += deltaTime;
+            if (State == TravelState.Junction && CanForward && decisionElapsed >= junctionWaitSeconds) BeginMove();
+            else if (State == TravelState.DeadEnd && autoUTurnAtDeadEnd && decisionElapsed >= deadEndWaitSeconds) BeginTurn(2);
         }
-        status = $"Steps: {steps}";
+    }
 
-        if (playerCell == goalCell)
+    private void Arrive()
+    {
+        if (PlayerCell == GoalCell) { State = TravelState.Complete; PendingTurn = ""; return; }
+        if (ApplyPendingTurn()) return;
+        int exits = (CanForward ? 1 : 0) + (CanLeft ? 1 : 0) + (CanRight ? 1 : 0);
+        if (exits == 1)
         {
-            hasWon = true;
-            status = $"Maze complete in {steps} steps. Press R for a new maze.";
-            if (updateVisualImmediately) Debug.Log(status);
+            if (CanForward) BeginMove();
+            else BeginTurn(CanLeft ? -1 : 1);
         }
+        else { State = exits == 0 ? TravelState.DeadEnd : TravelState.Junction; decisionElapsed = 0; }
+    }
+
+    private void BeginMove() { destination = PlayerCell + Directions[Heading]; State = TravelState.Moving; }
+    private void BeginTurn(int quarterTurns)
+    {
+        Heading = (Heading + quarterTurns + 4) % 4;
+        Turns++;
+        turnFrom = view.transform.rotation;
+        turnTo = Quaternion.Euler(0, Heading * 90, 0);
+        turnElapsed = 0;
+        State = TravelState.Turning;
+    }
+    private bool ApplyPendingTurn()
+    {
+        int turn = PendingTurn == "left" ? -1 : PendingTurn == "right" ? 1 : 2;
+        bool available = PendingTurn == "left" ? CanLeft : PendingTurn == "right" ? CanRight : CanUTurn;
+        if (PendingTurn.Length == 0 || !available) return false;
+        PendingTurn = "";
+        BeginTurn(turn);
         return true;
     }
 
-    /// <summary>Call this from an in-process BCI/ZeroMQ bridge.</summary>
-    public static bool SubmitExternalCommand(string command)
+    /// <summary>Main-thread endpoint. Accepted turns can wait for the next available exit.</summary>
+    public bool TryMove(string command)
     {
-        return Instance != null && Instance.TryMoveFromExternal(command);
+        string value = NormalizeCommand(command);
+        if (value == "restart") { GenerateMaze(); return true; }
+        if (value == "pause") { Paused = true; return true; }
+        if (value == "resume") { Paused = false; return true; }
+        if (value == "cancel") { PendingTurn = ""; return true; }
+        if (walkable == null || State == TravelState.Complete) return false;
+        if (value == "forward")
+        {
+            PendingTurn = "";
+            Paused = false;
+            if (State == TravelState.Junction && CanForward) BeginMove();
+            return true;
+        }
+        if (value != "left" && value != "right" && value != "uturn") return false;
+        PendingTurn = value;
+        if (!Paused && (State == TravelState.Junction || State == TravelState.DeadEnd)) ApplyPendingTurn();
+        return true;
     }
-
-    private void QueueExternalVisualSync()
+    public static bool SubmitExternalCommand(string command) => Instance != null && Instance.TryMove(command);
+    public bool MatchesExternalState(long generation, long x, long y, long heading, long steps, bool paused, string state)
+        => MazeGeneration == generation && PlayerCell.x == x && PlayerCell.y == y
+        && Heading == heading && Steps == steps && Paused == paused && State.ToString() == state;
+    public void TogglePause() => Paused = !Paused;
+    public static string NormalizeCommand(string raw)
     {
-        SynchronizationContext context = mainThreadContext;
-        if (context != null) context.Post(_ => SynchronizeExternalVisuals(), null);
+        switch ((raw ?? "").Trim().ToLowerInvariant())
+        {
+            case "left": case "turn_left": case "move_left": case "a": case "west": return "left";
+            case "right": case "turn_right": case "move_right": case "d": case "east": return "right";
+            case "uturn": case "u_turn": case "turn_around": case "back": case "backward":
+            case "down": case "move_down": case "south": case "s": return "uturn";
+            case "forward": case "up": case "move_up": case "north": case "w": return "forward";
+            case "stop": case "pause": return "pause";
+            case "resume": return "resume";
+            case "cancel": return "cancel";
+            case "restart": return "restart";
+            case "heartbeat": return "heartbeat";
+            case "status": return "status";
+            default: return "";
+        }
     }
+    public bool IsWalkable(Vector2Int cell) => walkable != null && cell.x >= 0 && cell.y >= 0
+        && cell.x < mazeWidth && cell.y < mazeHeight && walkable[cell.x, cell.y];
+    public Vector3 CellToWorld(Vector2Int cell) => new Vector3(cell.x * cellSize, 0, cell.y * cellSize);
+    private Vector3 EyePosition(Vector2Int cell) => CellToWorld(cell) + Vector3.up * eyeHeight;
 
     public IReadOnlyList<Vector2Int> GetHintPath()
     {
-        if (walkable == null) return Array.Empty<Vector2Int>();
         var queue = new Queue<Vector2Int>();
-        var visited = new bool[mazeWidth, mazeHeight];
         var parents = new Dictionary<Vector2Int, Vector2Int>();
-        queue.Enqueue(playerCell);
-        visited[playerCell.x, playerCell.y] = true;
-
+        queue.Enqueue(PlayerCell);
+        parents[PlayerCell] = PlayerCell;
         while (queue.Count > 0)
         {
-            Vector2Int current = queue.Dequeue();
-            if (current == goalCell) break;
-            foreach (Vector2Int direction in MoveDirections)
+            var current = queue.Dequeue();
+            if (current == GoalCell) break;
+            foreach (var direction in Directions)
             {
-                Vector2Int next = current + direction;
-                if (!IsWalkable(next) || visited[next.x, next.y]) continue;
-                visited[next.x, next.y] = true;
+                var next = current + direction;
+                if (!IsWalkable(next) || parents.ContainsKey(next)) continue;
                 parents[next] = current;
                 queue.Enqueue(next);
             }
         }
-
-        if (!visited[goalCell.x, goalCell.y]) return Array.Empty<Vector2Int>();
+        if (!parents.ContainsKey(GoalCell)) return Array.Empty<Vector2Int>();
         var path = new List<Vector2Int>();
-        for (Vector2Int current = goalCell; current != playerCell; current = parents[current]) path.Add(current);
-        path.Add(playerCell);
+        for (var cell = GoalCell; cell != PlayerCell; cell = parents[cell]) path.Add(cell);
+        path.Add(PlayerCell);
         path.Reverse();
         return path;
     }
-
-    private void ShowHintInConsole()
+    public void ShowHint()
     {
-        IReadOnlyList<Vector2Int> path = GetHintPath();
-        status = path.Count > 1 ? $"Hint: {path.Count - 1} moves remain (logged to Console)." : "Already at the exit.";
-        Debug.Log(status);
+        var path = GetHintPath();
+        if (path.Count < 2) { Hint = "Exit reached"; return; }
+        int direction = Array.IndexOf(Directions, path[1] - path[0]);
+        Hint = new[] { "Continue ahead", "Next exit: right", "Turn around", "Next exit: left" }[(direction - Heading + 4) % 4];
     }
-
-    private void BuildVisuals()
+    public object GetStatus() => new {
+        mode = "first_person_relative", maze_generation = MazeGeneration, state = State.ToString(), paused = Paused,
+        x = PlayerCell.x, y = PlayerCell.y, heading = Heading, heading_name = HeadingName,
+        steps = Steps, turns = Turns, pending_turn = PendingTurn, remaining_seconds = DecisionRemaining,
+        can_left = CanLeft, can_right = CanRight, can_forward = CanForward, can_uturn = CanUTurn,
+        goal_x = GoalCell.x, goal_y = GoalCell.y, elapsed_seconds = ElapsedSeconds
+    };
+    private void BuildMinimap()
     {
-        if (mapRenderer == null)
-        {
-            var mapObject = new GameObject("Maze Map");
-            mapObject.transform.SetParent(transform, false);
-            mapRenderer = mapObject.AddComponent<SpriteRenderer>();
-            mapRenderer.sortingOrder = 0;
-        }
-        if (playerRenderer == null)
-        {
-            var playerObject = new GameObject("Maze Player");
-            playerObject.transform.SetParent(transform, false);
-            playerRenderer = playerObject.AddComponent<SpriteRenderer>();
-            playerRenderer.sortingOrder = 2;
-            playerRenderer.sprite = Sprite.Create(Texture2D.whiteTexture, new Rect(0f, 0f, 1f, 1f), new Vector2(0.5f, 0.5f), 1f);
-            playerRenderer.color = playerColor;
-            playerRenderer.transform.localScale = new Vector3(0.58f, 0.58f, 1f);
-        }
-
-        mazeTexture = new Texture2D(mazeWidth, mazeHeight, TextureFormat.RGBA32, false)
-        {
-            name = "RuntimeMazeTexture",
-            filterMode = FilterMode.Point,
-            wrapMode = TextureWrapMode.Clamp
-        };
+        if (Minimap != null) Destroy(Minimap);
+        Minimap = new Texture2D(mazeWidth, mazeHeight) { filterMode = FilterMode.Point };
         for (int x = 0; x < mazeWidth; x++)
         for (int y = 0; y < mazeHeight; y++)
-            mazeTexture.SetPixel(x, y, walkable[x, y] ? floorColor : wallColor);
-        mazeTexture.SetPixel(startCell.x, startCell.y, startColor);
-        mazeTexture.SetPixel(goalCell.x, goalCell.y, goalColor);
-        mazeTexture.Apply(false, false);
-
-        mapRenderer.sprite = Sprite.Create(mazeTexture, new Rect(0f, 0f, mazeWidth, mazeHeight), new Vector2(0.5f, 0.5f), 1f);
-        mapRenderer.transform.position = new Vector3((mazeWidth - 1) * 0.5f, (mazeHeight - 1) * 0.5f, 0f);
-        playerRenderer.transform.position = GridToWorld(playerCell);
+            Minimap.SetPixel(x, y, walkable[x, y] ? new Color(0.76f, 0.83f, 0.83f) : new Color(0.08f, 0.16f, 0.18f));
+        Minimap.SetPixel(1, 1, new Color(0.14f, 0.78f, 0.65f));
+        Minimap.SetPixel(GoalCell.x, GoalCell.y, new Color(1f, 0.55f, 0.25f));
+        Minimap.Apply();
     }
-
-    private void ConfigureCamera()
+    private void OnDestroy()
     {
-        gameCamera = Camera.main;
-        if (gameCamera == null) return;
-        gameCamera.orthographic = true;
-        gameCamera.backgroundColor = wallColor;
-        UpdateCameraPosition();
-    }
-
-    private void ToggleCameraView()
-    {
-        followPlayerCamera = !followPlayerCamera;
-        UpdateCameraPosition();
-        status = followPlayerCamera ? "Player-follow camera enabled." : "Full-map overview enabled.";
-    }
-
-    private void UpdateCameraPosition()
-    {
-        if (gameCamera == null) gameCamera = Camera.main;
-        if (gameCamera == null) return;
-
-        float requiredByHeight = mazeHeight * 0.5f + 1.5f;
-        float requiredByWidth = mazeWidth / (2f * Mathf.Max(gameCamera.aspect, 0.1f)) + 1.5f;
-        if (followPlayerCamera)
-        {
-            gameCamera.orthographicSize = playerViewSize;
-            Vector3 playerPosition = GridToWorld(playerCell);
-            gameCamera.transform.position = new Vector3(playerPosition.x, playerPosition.y, -10f);
-            return;
-        }
-
-        gameCamera.orthographicSize = Mathf.Max(requiredByHeight, requiredByWidth);
-        gameCamera.transform.position = new Vector3((mazeWidth - 1) * 0.5f, (mazeHeight - 1) * 0.5f, -10f);
-    }
-
-    private Vector3 GridToWorld(Vector2Int cell) => new Vector3(cell.x, cell.y, 0f);
-    private bool IsInterior(Vector2Int cell) => cell.x > 0 && cell.x < mazeWidth - 1 && cell.y > 0 && cell.y < mazeHeight - 1;
-    private bool IsWalkable(Vector2Int cell) => cell.x >= 0 && cell.x < mazeWidth && cell.y >= 0 && cell.y < mazeHeight && walkable[cell.x, cell.y];
-    private static int MakeOdd(int value) => value % 2 == 0 ? value + 1 : value;
-
-    private static bool TryParseDirection(string raw, out Vector2Int direction)
-    {
-        string command = (raw ?? string.Empty).Trim().ToLowerInvariant();
-        switch (command)
-        {
-            case "up": case "north": case "forward": case "w": case "move_up": direction = Vector2Int.up; return true;
-            case "down": case "south": case "back": case "backward": case "s": case "move_down": direction = Vector2Int.down; return true;
-            case "left": case "west": case "a": case "move_left": direction = Vector2Int.left; return true;
-            case "right": case "east": case "d": case "move_right": direction = Vector2Int.right; return true;
-            default: direction = Vector2Int.zero; return false;
-        }
-    }
-
-    private void OnGUI()
-    {
-        if (walkable == null) return;
-        const int width = 440;
-        GUI.Box(new Rect(16, 16, width, 136), "BCI Maze — Large Random Map");
-        GUI.Label(new Rect(30, 45, width - 24, 24), "Move: WASD / Arrow keys  |  New maze: R  |  Hint: H  |  View: V");
-        GUI.Label(new Rect(30, 68, width - 24, 24), "External UDP: 127.0.0.1:7777  (up, down, left, right)");
-        GUI.Label(new Rect(30, 91, width - 24, 24), status);
-        if (ExternalMazeInput.Instance != null)
-            GUI.Label(new Rect(30, 114, width - 24, 24), ExternalMazeInput.Instance.LinkStatus);
+        if (Instance == this) Instance = null;
+        Input.imeCompositionMode = previousImeMode;
+        if (Minimap != null) Destroy(Minimap);
     }
 }

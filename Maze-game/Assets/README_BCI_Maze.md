@@ -1,103 +1,109 @@
-# Unity BCI Maze 接口说明
+# Unity BCI Maze：3D 第一人称 Demo
 
-## 项目与场景
+Unity 2022.3.57f1c1，打开 `Scenes/SampleScene.unity` 后 Play 即可。默认 15 × 15，运行时生成墙体、步道、阳光、引导灯带、出口和第一人称相机，无需额外美术资源。
 
-- Unity 版本：2022.3.57f1c1
-- 场景：Scenes/SampleScene.unity
-- 迷宫控制脚本：Scripts/MazeGameController.cs
-- 外部输入脚本：Scripts/ExternalMazeInput.cs
-- 默认迷宫：61 × 61
-- 默认监听：127.0.0.1:7777
+## 流程
 
-打开 SampleScene.unity 后点击 Play 即可运行。场景中应包含 MazeGameController 和 ExternalMazeInput；如果复制到新场景，需确认两个组件都已挂载并启用。
+- 直道自动前进，唯一出口的弯道自动转弯。
+- 分岔处停留 4 秒供选择；有直行路则到时自动直行，没有直行路的 T 字口一直等待左右选择。
+- 左右指令是相对当前面朝方向的转向，不是世界坐标平移。
+- 行进或转身过程中可提前预约，遇到下一个对应方向可走的格子时执行。新指令替换旧预约，不累积一串转向。
+- 掉头在下一个格子中心执行，避免在墙边转身；死胡同默认等待 2 秒后自动掉头，可关闭自动掉头并手动发送。
+- 无指令时保持自动行走；脑机输出 unknown / 不发送指令不会暂停游戏。
+- 到达橙色出口停止，显示步数、转向次数和用时。
 
-## 游戏操作
+## 操作
 
 | 输入 | 行为 |
 | --- | --- |
-| W / ↑ | 向上 |
-| S / ↓ | 向下 |
-| A / ← | 向左 |
-| D / → | 向右 |
-| R | 重新生成迷宫 |
-| H | 计算并显示 BFS 最短路长度 |
-| V | 在跟随视角和全图视角之间切换 |
+| A / ← | 预约左转 |
+| D / → | 预约右转 |
+| S / ↓ | 预约掉头 |
+| W / ↑ | 清除预约并继续；路口有直行出口时立即直行 |
+| Space | 暂停 / 恢复 |
+| R | 新地图并重置进度 |
+| H | BFS 下一步提示 |
+| M / V | 显示 / 隐藏小地图 |
 
-迷宫由迭代 DFS 生成，起点为 (1, 1)，终点为 (width - 2, height - 2)。墙体不可通行；到达终点后会显示完成状态。跟随相机和全图相机都由 MazeGameController 管理。
+屏幕下方提供左右转、掉头按钮，左下角提供暂停、重建与设置，右下角是提示。设置可调步速、路口等待时长、死胡同自动掉头和小地图。核心参数也直接暴露在 Inspector 中。
 
 ## UDP 协议
 
-Unity 默认只绑定回环地址，因此本机程序可以发送，局域网其他主机不能直接访问。支持纯文本和 JSON 两种载荷，方向会被归一化为以下命令：
+默认 `127.0.0.1:7777`，兼容纯文本与 JSON：
 
-| 规范命令 | 可接受别名 |
+```json
+{"command":"left","ts":123.4}
+```
+
+| 指令 | 含义 |
 | --- | --- |
-| left | left、west、a、move_left |
-| right | right、east、d、move_right |
-| up | up、north、w、move_up、forward |
-| down | down、south、s、move_down、backward |
+| left / turn_left | 相对左转 |
+| right / turn_right | 相对右转 |
+| uturn / turn_around | 掉头 |
+| forward | 清除预约、恢复前进；不能穿墙 |
+| pause / stop | 暂停自动导航 |
+| resume | 恢复自动导航 |
+| cancel | 取消预约，不改变暂停状态 |
+| restart | 重新生成迷宫 |
+| heartbeat / status | 不移动，返回 ACK 与状态 |
 
-纯文本示例：
+旧 `up/move_up/w/north` 兼容为 forward，`down/move_down/s/south/back/backward` 兼容为 uturn，`a/west/move_left` 和 `d/east/move_right` 分别兼容 left/right。ACK 的 command 是归一化后的名称。
 
-~~~powershell
-$client = New-Object System.Net.Sockets.UdpClient
-$bytes = [Text.Encoding]::UTF8.GetBytes("left")
-$client.Send($bytes, $bytes.Length, "127.0.0.1", 7777)
-$client.Close()
-~~~
+```json
+{
+  "command": "left",
+  "accepted": true,
+  "echo_ts": 123.4,
+  "navigation": {
+    "mode": "first_person_relative",
+    "state": "Moving",
+    "paused": false,
+    "x": 1,
+    "y": 2,
+    "heading": 0,
+    "heading_name": "N",
+    "pending_turn": "left"
+  }
+}
+```
 
-JSON 示例：
+示例节选了 navigation 字段。实际还返回步数、转向次数、左右/前后出口、路口剩余等待时间、终点和用时。heading 0/1/2/3 对应北/东/南/西。移动期间 x/y 是最近到达的格子中心；Turning 期间 heading 是本次转身的目标方向。
 
-~~~json
-{"command":"left"}
-~~~
+**accepted=true 表示指令已被接受，可能只是预约成功，不等于已经转身或移动。** 可以用 status 查询 pending_turn 和 state。暂停时也允许预约，恢复后执行；通关后转向返回 false。heartbeat/status 不会触发移动。
 
-Unity 会返回 JSON ACK：
+UDP 工作线程只接收并入队，主线程执行导航并返回 ACK。`ExternalMazeInput.SubmitCommand` 可从其他线程调用，返回值仅表示入队；`MazeGameController.SubmitExternalCommand` 是主线程同步入口。这样无需在游戏状态上维护并发锁。
 
-~~~json
-{"command":"left","accepted":true}
-~~~
+## 接入脑机分类
 
-accepted 为 true 表示该命令已被游戏逻辑接受并执行；false 通常表示命令非法、迷宫墙体阻挡、已经完成或当前状态不允许移动。ACK 不代表模型预测正确，只代表 Unity 对这次移动的处理结果。
+现有左右手二分类的 left/right 可以直接使用。只靠二分类仍可在 T 字口选择方向，在直行分岔时选择转弯或等待直行，死胡同由自动掉头恢复。
 
-## 节流与线程语义
+```powershell
+.\bci-mi.cmd online --model outputs/subject_models/S01/semhaf16.pt --backend brainflow --unity-host 127.0.0.1 --plot
+```
 
-键盘输入使用 MazeGameController 的 moveCooldownSeconds，默认值为 0.12 秒。外部 UDP 路径由接收器直接提交到游戏逻辑，不应依赖这个键盘冷却值；发送方应自行控制发送频率，建议相邻命令至少间隔 120–150 ms，避免连续预测造成过快移动。
+默认路口模式取得暂停确认后重新积累 4 秒脑电与平滑历史，每个路口接收一个稳定决策。T 字口为左右选择；单侧出口与直行组合时，左右手对应左右排列的两个选项。三出口处左右手对应左转、右转，直行保留键盘和按钮入口。断流取消旧预约，恢复后重新积累数据。训练和采集入口见 [SE-MHAF 真机流程](../../doc/SE_MHAF_LIVE.md)。
 
-代码中有两种外部调用方式，返回值含义不同：
+状态回执新增 `maze_generation`，每次生成地图递增。JSON 请求可携带 `expected` 对象，包含 `maze_generation,x,y,heading,steps,paused,state,pending_turn`；Unity 主线程在执行前逐项核对，过期条件返回 `accepted=false`。省略 `expected` 保留原有协议行为。
 
-- MazeGameController.SubmitExternalCommand：同步调用，返回命令是否被迷宫逻辑接受。
-- ExternalMazeInput.SubmitCommand：当组件实例存在时把命令加入主线程队列，返回 true 只表示成功入队，不等于角色已经移动；Update 中实际处理后才知道是否接受。
-- maxCommandsPerFrame 默认是 4，只限制 ExternalMazeInput 的主线程队列处理速度。
+BCIC2a 回放可选双脚掉头映射：
 
-因此，外部程序若需要可靠记录，应以收到的 UDP ACK 为准，并同时记录发送时间、预测类别、置信度和迷宫状态。
+```powershell
+python scripts/run_bci_maze_integration.py --host 127.0.0.1 --port 7777 --label-map configs/label_maps/bcic2a_relative.json
+```
 
-## 与 Python 解码脚本联调
+左右手分别 left/right，双脚 uturn，舌头不发送指令。该映射不会让现有二分类模型额外识别双脚；主动掉头也可由按键/鼠标完成。
 
-先在 Unity 中打开 SampleScene.unity 并点击 Play，再运行仓库根目录的联调脚本：
+## 代码与验证
 
-~~~powershell
-python scripts/run_bci_maze_integration.py --host 127.0.0.1 --port 7777
-~~~
+- `Scripts/MazeGameController.cs`：DFS、导航状态、平滑移动/转向、BFS 与查询接口。
+- `Scripts/MazeWorldRenderer.cs`：3D 几何体、共享材质和照明。
+- `Scripts/MazeHud.cs`：HUD、小地图、按钮与设置。
+- `Scripts/ExternalMazeInput.cs`：UDP 队列、结构化 JSON、ACK。
 
-脚本默认读取：
+在仓库根目录、Unity Play 模式下运行：
 
-- BCIC2a A01 的 E 测试数据；
-- outputs/checkpoints/bcic2a/se_mhaf_conformer_final/A01.pt；
-- 模型 se_mhaf_conformer_final_logvar；
-- 标签 0、1、2 分别映射为 left、right、up，标签 3 不发送移动。
+```powershell
+uv run scripts/validate_unity_maze.py
+```
 
-脚本发送方向指令、等待 ACK，并把结果写入 outputs/bci_maze_integration_test.json。该过程是端到端冒烟测试，不是通关率或在线准确率评估；模型预测到墙体方向时，Unity 正确返回 accepted=false 是预期行为。
-
-## 调试建议
-
-1. Unity Console 先确认 ExternalMazeInput 已启动并监听 7777。
-2. 用纯文本 left 或 JSON {"command":"left"} 做最小 UDP 测试。
-3. 检查 ACK 的 accepted 字段，不要只检查发送函数是否返回。
-4. 再运行 Python 联调脚本，确认 checkpoint、预处理目录和 Unity 端口一致。
-5. 如需改变端口或监听地址，同时修改场景组件参数、Python 脚本参数和本文档。
-
-## 安全与研究边界
-
-默认回环监听是为了降低误接收风险；脚本没有身份认证、加密或重放保护，不适合直接暴露到公网。若要跨主机使用，应增加鉴权、访问控制和异常速率限制。
-
-Unity 的 accepted 只说明移动是否被迷宫规则接受，不能作为脑机解码真值。研究记录应区分“模型预测”“命令发送”“Unity 接收”“移动接受”“撞墙/无效”和“到达终点”等事件。
+验证会重建当前运行中的地图，以加速步速检查实际 UDP 通关，结束后恢复原步速/等待参数并暂停在新地图起点。它不使用 EEG 数据，也不代表真实脑机通关率。设计与验证结果见 `doc/UNITY_FIRST_PERSON_DEMO.md`；MCP 配置见 `doc/UNITY_MCP_SETUP.md`。

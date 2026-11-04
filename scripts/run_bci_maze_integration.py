@@ -26,7 +26,8 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from bci_maze.models import build_model
 from bci_maze.online import load_label_map
-from bci_maze.training import prepare_subject_data
+from bci_maze.preprocessing import load_processed_session
+from bci_maze.training import prepare_evaluation_session, prepare_subject_data
 
 
 def display_path(path: Path) -> str:
@@ -69,6 +70,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--subject", type=int, default=1)
     parser.add_argument("--dataset", choices=("bcic2a", "bcic2b"), default="bcic2a")
+    parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--max-trials", type=int, default=32)
     parser.add_argument(
         "--full-replay",
@@ -86,24 +88,42 @@ def main() -> int:
     label_map_path = Path(args.label_map) if args.label_map else ROOT / "configs" / "label_maps" / f"{args.dataset}.json"
     label_map = load_label_map(label_map_path)
 
-    data = prepare_subject_data(
-        ROOT / f"data/processed/{args.dataset}",
-        subject=args.subject,
-        model_name="se_mhaf_conformer_final_logvar" if args.dataset == "bcic2a" else "se_mhaf_conformer_final",
-        validation_size=0.2,
-        seed=42 + args.subject,
-        exclude_artifacts=True,
-        file_prefix=prefix,
+    checkpoint = args.checkpoint or (
+        ROOT
+        / f"outputs/checkpoints/{args.dataset}/se_mhaf_conformer_final/{prefix}{args.subject:02d}.pt"
     )
-    test_x = data["test_x"]
-    test_y = data["test_y"]
+    checkpoint_payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
+    model_name = str(checkpoint_payload.get("model_name", "se_mhaf_conformer_final"))
+    checkpoint_config = checkpoint_payload.get("config", {})
+    exclude_artifacts = bool(checkpoint_config.get("exclude_artifacts", True))
+    processed_dir = ROOT / f"data/processed/{args.dataset}"
+    if checkpoint_payload.get("norm_stats") is not None:
+        session = load_processed_session(
+            processed_dir, args.subject, "E", file_prefix=prefix
+        )
+        test_x, test_y = prepare_evaluation_session(
+            session,
+            model_name,
+            checkpoint_payload["norm_stats"],
+            exclude_artifacts=exclude_artifacts,
+        )
+    else:
+        data = prepare_subject_data(
+            processed_dir,
+            subject=args.subject,
+            model_name=model_name,
+            validation_size=float(checkpoint_config.get("validation_size", 0.2)),
+            seed=int(checkpoint_config.get("seed", 42)) + args.subject,
+            exclude_artifacts=exclude_artifacts,
+            file_prefix=prefix,
+        )
+        test_x, test_y = data["test_x"], data["test_y"]
     if test_y.size == 0:
         raise ValueError("The evaluation session has no usable trials")
     if test_y.min() < 0 or test_y.max() >= label_map.n_classes:
         raise ValueError(
             f"Evaluation labels are outside the configured {label_map.n_classes} classes"
         )
-    checkpoint = ROOT / f"outputs/checkpoints/{args.dataset}/se_mhaf_conformer_final/{prefix}{args.subject:02d}.pt"
     model, model_name = load_model(checkpoint, test_x.shape[-2], test_x.shape[-1], label_map.n_classes)
 
     attempts: list[dict[str, object]] = []

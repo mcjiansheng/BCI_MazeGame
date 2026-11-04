@@ -1,247 +1,135 @@
 using System;
 using System.Collections.Concurrent;
-using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading;
+using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 using UnityEngine;
 
-/// <summary>
-/// Thread-safe external command adapter. It accepts UTF-8 UDP commands on the
-/// configured loopback port and queues them for MazeGameController on Unity's main thread.
-///
-/// Payloads are either exact command tokens ("left") or flat JSON objects
-/// ({"command":"left","ts":123.4}). Substring matching is deliberately avoided
-/// so payloads such as {"status":"backup"} can never trigger a movement.
-/// A "heartbeat" command keeps the link status alive without moving the player.
-/// </summary>
+/// <summary>UDP receives on a worker; navigation and ACKs run on Unity's main thread.</summary>
 [DisallowMultipleComponent]
 public sealed class ExternalMazeInput : MonoBehaviour
 {
     public static ExternalMazeInput Instance { get; private set; }
-
-    [Header("UDP BCI bridge")]
-    [Min(1024)] public int udpPort = 7777;
+    public int udpPort = 7777;
     public bool listenOnLoopbackOnly = true;
-    [Range(1, 32)] public int maxCommandsPerFrame = 4;
-    [Range(1f, 60f)] public float linkStaleSeconds = 5f;
-    public int ReceivedUdpCommandCount => Volatile.Read(ref receivedUdpCommandCount);
-    public int ProcessedCommandCount => Volatile.Read(ref processedCommandCount);
-
-    /// <summary>Human-readable inference link state for HUD display.</summary>
-    public string LinkStatus
-    {
-        get
-        {
-            long ticks = Interlocked.Read(ref lastPacketUtcTicks);
-            if (ticks == 0) return "BCI bridge: waiting for packets";
-            double ageSeconds = (DateTime.UtcNow.Ticks - ticks) / (double)TimeSpan.TicksPerSecond;
-            return ageSeconds <= linkStaleSeconds
-                ? $"BCI bridge: online ({ageSeconds:F1}s ago)"
-                : $"BCI bridge: stale ({ageSeconds:F0}s ago)";
-        }
-    }
-
-    private readonly ConcurrentQueue<ReceivedCommand> pendingCommands = new ConcurrentQueue<ReceivedCommand>();
+    public int maxCommandsPerFrame = 4;
+    public float linkStaleSeconds = 5f;
+    public int ReceivedUdpCommandCount => received;
+    public int ProcessedCommandCount => processed;
+    public string LinkStatus => lastPacketTicks == 0 ? "BCI waiting"
+        : (DateTime.UtcNow.Ticks - Interlocked.Read(ref lastPacketTicks)) / (double)TimeSpan.TicksPerSecond < linkStaleSeconds
+            ? "BCI connected" : "BCI idle";
+    private struct Command { public string payload; public IPEndPoint remote; }
+    private readonly ConcurrentQueue<Command> pending = new ConcurrentQueue<Command>();
     private UdpClient client;
-    private Thread receiveThread;
-    private volatile bool receiving;
-    private long lastPacketUtcTicks;
-    private int receivedUdpCommandCount;
-    private int processedCommandCount;
-
-    private void Awake()
-    {
-        Instance = this;
-    }
+    private Thread receiver;
+    private volatile bool running;
+    private int received, processed;
+    private long lastPacketTicks;
 
     private void OnEnable()
     {
-        StartListener();
-    }
-
-    private void Update()
-    {
-        int processed = 0;
-        while (processed < maxCommandsPerFrame && pendingCommands.TryDequeue(out ReceivedCommand received))
-        {
-            bool accepted = MazeGameController.SubmitExternalCommand(received.command);
-            if (received.replyTo != null) SendAcknowledgement(received.replyTo, received.command, accepted, null);
-            Interlocked.Increment(ref processedCommandCount);
-            processed++;
-        }
-    }
-
-    /// <summary>Use this from another Unity plugin (including a ZeroMQ bridge).</summary>
-    public static bool SubmitCommand(string command)
-    {
-        if (string.IsNullOrWhiteSpace(command)) return false;
-        if (Instance == null) return MazeGameController.SubmitExternalCommand(command);
-        string normalized = NormalizePayload(command);
-        if (string.IsNullOrEmpty(normalized) || normalized == "heartbeat") return false;
-        Instance.pendingCommands.Enqueue(new ReceivedCommand(normalized, null));
-        return true;
-    }
-
-    private void StartListener()
-    {
+        Instance = this;
         try
         {
-            IPAddress address = listenOnLoopbackOnly ? IPAddress.Loopback : IPAddress.Any;
-            client = new UdpClient(new IPEndPoint(address, udpPort));
-            receiving = true;
-            receiveThread = new Thread(ReceiveLoop) { IsBackground = true, Name = "Maze UDP Input" };
-            receiveThread.Start();
-            Debug.Log($"Maze external input listening on udp://{address}:{udpPort}");
+            client = new UdpClient(new IPEndPoint(listenOnLoopbackOnly ? IPAddress.Loopback : IPAddress.Any, udpPort));
+            running = true;
+            receiver = new Thread(Receive) { IsBackground = true, Name = "Maze UDP" };
+            receiver.Start();
+            Debug.Log($"First-person maze UDP listening on {udpPort}");
         }
-        catch (Exception exception)
-        {
-            Debug.LogError($"Could not start the maze UDP input on port {udpPort}: {exception.Message}");
-        }
+        catch (SocketException error) { Debug.LogWarning($"Maze UDP: {error.Message}"); }
     }
-
-    private void ReceiveLoop()
+    private void Receive()
     {
         var remote = new IPEndPoint(IPAddress.Any, 0);
         try
         {
-            while (receiving)
+            while (running)
             {
-                byte[] bytes = client.Receive(ref remote);
-                string payload = Encoding.UTF8.GetString(bytes);
-                if (string.IsNullOrWhiteSpace(payload)) continue;
-                // Any datagram from the bridge proves the link is alive, even
-                // if the payload itself is not a movement command.
-                Interlocked.Exchange(ref lastPacketUtcTicks, DateTime.UtcNow.Ticks);
-
-                string command = NormalizePayload(payload);
-                string echoTimestamp = ExtractJsonRawValue(payload, "ts");
-                if (command == "heartbeat")
-                {
-                    SendAcknowledgement(new IPEndPoint(remote.Address, remote.Port), command, true, echoTimestamp);
-                    continue;
-                }
-                if (string.IsNullOrEmpty(command)) continue;
-
-                // UDP runs on a worker thread. The maze state update is protected by
-                // MazeGameController; the visible player is synchronized in LateUpdate.
-                bool accepted = MazeGameController.SubmitExternalCommand(command);
-                SendAcknowledgement(new IPEndPoint(remote.Address, remote.Port), command, accepted, echoTimestamp);
-                Interlocked.Increment(ref receivedUdpCommandCount);
-                Interlocked.Increment(ref processedCommandCount);
+                var bytes = client.Receive(ref remote);
+                Interlocked.Exchange(ref lastPacketTicks, DateTime.UtcNow.Ticks);
+                Interlocked.Increment(ref received);
+                pending.Enqueue(new Command { payload = Encoding.UTF8.GetString(bytes), remote = new IPEndPoint(remote.Address, remote.Port) });
             }
         }
-        catch (SocketException) when (!receiving) { }
-        catch (ObjectDisposedException) when (!receiving) { }
-        catch (Exception exception)
+        catch (SocketException) when (!running) { }
+        catch (ObjectDisposedException) when (!running) { }
+        catch (Exception error) { Debug.LogWarning($"Maze UDP stopped: {error.Message}"); }
+    }
+    private void Update()
+    {
+        for (int i = 0; i < maxCommandsPerFrame && pending.TryDequeue(out var item); i++)
         {
-            if (receiving) Debug.LogError($"Maze UDP receiver stopped: {exception.Message}");
+            string raw = item.payload.Trim();
+            JToken timestamp = null;
+            JToken expected = null;
+            try
+            {
+                if (raw.StartsWith("{"))
+                {
+                    var json = JObject.Parse(raw);
+                    raw = (string)json["command"] ?? "";
+                    timestamp = json["ts"];
+                    expected = json["expected"];
+                }
+            }
+            catch (JsonException) { raw = ""; }
+            string command = MazeGameController.NormalizeCommand(raw);
+            // Validation and navigation run consecutively on Unity's main thread.
+            // A restart, resume, or move between status and command invalidates the old decision.
+            bool expectedMatches = expected == null || MatchesExpected(expected);
+            bool accepted = expectedMatches && (command == "heartbeat" || command == "status"
+                || (command.Length > 0 && MazeGameController.SubmitExternalCommand(command)));
+            processed++;
+            if (item.remote == null) continue;
+            var response = new JObject { ["command"] = command, ["accepted"] = accepted };
+            if (timestamp != null) response["echo_ts"] = timestamp;
+            if (MazeGameController.Instance != null)
+                response["navigation"] = JObject.FromObject(MazeGameController.Instance.GetStatus());
+            byte[] bytes = Encoding.UTF8.GetBytes(response.ToString(Formatting.None));
+            try { client.Send(bytes, bytes.Length, item.remote); }
+            catch (SocketException error) { Debug.LogWarning($"Maze ACK: {error.Message}"); }
         }
     }
-
-    private static string NormalizePayload(string payload)
+    private static bool MatchesExpected(JToken token)
     {
-        string value = (payload ?? string.Empty).Trim();
-        if (value.Length == 0) return string.Empty;
-        if (value[0] == '{')
-            return NormalizeToken(ExtractJsonStringField(value, "command"));
-        return NormalizeToken(value);
-    }
-
-    private static string NormalizeToken(string token)
-    {
-        switch ((token ?? string.Empty).Trim().ToLowerInvariant())
+        var expected = token as JObject;
+        var game = MazeGameController.Instance;
+        if (expected == null || game == null) return false;
+        foreach (string key in new[] { "maze_generation", "x", "y", "heading", "steps" })
+            if (expected[key]?.Type != JTokenType.Integer) return false;
+        if (expected["paused"]?.Type != JTokenType.Boolean || expected["state"]?.Type != JTokenType.String) return false;
+        if (expected["pending_turn"] != null && (expected["pending_turn"].Type != JTokenType.String
+            || (string)expected["pending_turn"] != game.PendingTurn)) return false;
+        try
         {
-            case "up": case "north": case "forward": case "w": case "move_up": return "up";
-            case "down": case "south": case "back": case "backward": case "s": case "move_down": return "down";
-            case "left": case "west": case "a": case "move_left": return "left";
-            case "right": case "east": case "d": case "move_right": return "right";
-            case "heartbeat": return "heartbeat";
-            default: return string.Empty;
+            return game.MatchesExternalState((long)expected["maze_generation"], (long)expected["x"],
+                (long)expected["y"], (long)expected["heading"], (long)expected["steps"],
+                (bool)expected["paused"], (string)expected["state"]);
+        }
+        catch (Exception error) when (error is OverflowException || error is FormatException || error is InvalidCastException)
+        {
+            return false;
         }
     }
-
-    /// <summary>Extracts a string field from a flat JSON payload without allocation-heavy parsing.</summary>
-    private static string ExtractJsonStringField(string json, string field)
+    /// <summary>Thread-safe plugin entry point; true means enqueued, not yet executed.</summary>
+    public static bool SubmitCommand(string command)
     {
-        int fieldIndex = json.IndexOf($"\"{field}\"", StringComparison.OrdinalIgnoreCase);
-        if (fieldIndex < 0) return null;
-        int colonIndex = json.IndexOf(':', fieldIndex + field.Length + 2);
-        if (colonIndex < 0) return null;
-        int start = json.IndexOf('"', colonIndex + 1);
-        if (start < 0) return null;
-        int end = json.IndexOf('"', start + 1);
-        if (end < 0) return null;
-        return json.Substring(start + 1, end - start - 1);
+        if (Instance == null || string.IsNullOrWhiteSpace(command)) return false;
+        Instance.pending.Enqueue(new Command { payload = command });
+        return true;
     }
-
-    /// <summary>Extracts a raw (unquoted) numeric field, e.g. "ts", for echoing back.</summary>
-    private static string ExtractJsonRawValue(string json, string field)
-    {
-        int fieldIndex = json.IndexOf($"\"{field}\"", StringComparison.OrdinalIgnoreCase);
-        if (fieldIndex < 0) return null;
-        int colonIndex = json.IndexOf(':', fieldIndex + field.Length + 2);
-        if (colonIndex < 0) return null;
-        var builder = new StringBuilder();
-        for (int index = colonIndex + 1; index < json.Length; index++)
-        {
-            char character = json[index];
-            if (char.IsWhiteSpace(character) && builder.Length == 0) continue;
-            if (character == ',' || character == '}') break;
-            // Only numeric characters are echoed; anything else aborts the value.
-            if (
-                !char.IsDigit(character)
-                && character != '.'
-                && character != '-'
-                && character != '+'
-                && character != 'e'
-                && character != 'E'
-            ) break;
-            builder.Append(character);
-        }
-        string rawValue = builder.ToString();
-        if (
-            !double.TryParse(
-                rawValue,
-                NumberStyles.Float,
-                CultureInfo.InvariantCulture,
-                out double parsed
-            )
-            || double.IsNaN(parsed)
-            || double.IsInfinity(parsed)
-        ) return null;
-        return parsed.ToString("R", CultureInfo.InvariantCulture);
-    }
-
-    private static void SendAcknowledgement(IPEndPoint destination, string command, bool accepted, string echoTimestamp)
-    {
-        string timestampField = string.IsNullOrEmpty(echoTimestamp)
-            ? string.Empty
-            : $",\"echo_ts\":{echoTimestamp}";
-        string json = $"{{\"command\":\"{command}\",\"accepted\":{accepted.ToString().ToLowerInvariant()}{timestampField}}}";
-        byte[] bytes = Encoding.UTF8.GetBytes(json);
-        using (var response = new UdpClient()) response.Send(bytes, bytes.Length, destination);
-    }
-
-    private readonly struct ReceivedCommand
-    {
-        public readonly string command;
-        public readonly IPEndPoint replyTo;
-
-        public ReceivedCommand(string command, IPEndPoint replyTo)
-        {
-            this.command = command;
-            this.replyTo = replyTo;
-        }
-    }
-
     private void OnDisable()
     {
-        receiving = false;
+        running = false;
         client?.Close();
-        if (receiveThread != null && receiveThread.IsAlive) receiveThread.Join(250);
-        receiveThread = null;
+        receiver?.Join(250);
         client = null;
+        while (pending.TryDequeue(out _)) { }
+        if (Instance == this) Instance = null;
     }
 }

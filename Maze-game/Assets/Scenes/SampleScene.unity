@@ -167,16 +167,19 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: de15ec3ac970bcd4ba46c8fe03eca648, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  mazeWidth: 61
-  mazeHeight: 61
-  moveCooldownSeconds: 0.12
+  mazeWidth: 15
+  mazeHeight: 15
   useFixedSeed: 0
-  fixedSeed: 20260723
-  wallColor: {r: 0.07, g: 0.12, b: 0.22, a: 1}
-  floorColor: {r: 0.82, g: 0.88, b: 0.93, a: 1}
-  startColor: {r: 0.15, g: 0.72, b: 0.38, a: 1}
-  goalColor: {r: 0.9, g: 0.24, b: 0.28, a: 1}
-  playerColor: {r: 1, g: 0.78, b: 0.1, a: 1}
+  fixedSeed: 20260920
+  cellSize: 2.8
+  moveSpeed: 2.6
+  turnSeconds: 0.45
+  fieldOfView: 78
+  eyeHeight: 1.6
+  junctionWaitSeconds: 4
+  autoUTurnAtDeadEnd: 1
+  deadEndWaitSeconds: 2
+  showMinimap: 1
 --- !u!4 &114781064
 Transform:
   m_ObjectHideFlags: 0

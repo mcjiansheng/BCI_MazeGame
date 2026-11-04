@@ -1,8 +1,15 @@
 # 文档索引
 
+- [2026-10-31 实际采集整理](COLLECTION_20261031.md)：S03 编号更正、S01–S04 采集数量、逐次数据索引与连接恢复统计。
+
 本目录记录 BCI Maze 的数据处理、模型实验、算法说明和 Unity 联调信息。项目入口说明请先看根目录 [README.md](../README.md)。
 
 ## 当前实现与实验文档
+
+- [SE-MHAF 十六通道真机流程](SE_MHAF_LIVE.md)：公开预训练、短轮采集、个人微调、路口控制、自动恢复与验证结果。
+- [本机 MI 运行说明](LOCAL_MI_SETUP.md)：独立环境、Windows 启动入口、core-8 保持不变的十六路接线和本机硬件诊断状态。
+- [MI 代码审查记录](MI_CODE_REVIEW.md)：已修复问题、回归验证与尚需实际实验验证的限制。
+- [LK-Mini 间歇性断流诊断](LK_TRANSPORT_DIAGNOSIS_20260905.md)：厂商 USB 接入方式、原始 TCP 对照、60 秒真机结果与待隔离的故障范围。
 
 - [BCIC2a 预处理与三模型实现说明](BCIC2a预处理与三模型实现说明.md)：BCIC2a 数据格式、事件窗口、滤波器组和基础模型。
 - [BCIC2b 预处理与适配说明](BCIC2b预处理与适配说明.md)：BNCI 004-2014 / BCIC2b 的 MAT 读取和三通道适配。
@@ -14,7 +21,7 @@
 - [迷宫生成与寻路算法原理](迷宫生成与寻路算法原理.md)：Unity 迷宫生成、BFS 寻路和可视化逻辑。
 - [Unity BCI Maze 接口说明](../Maze-game/Assets/README_BCI_Maze.md)：键盘操作、UDP 协议、ACK 语义和 Python 联调。
 - [LK-Mini-EEG16 在线 MI 系统调研与实施工作流](在线MI系统调研与实施工作流.md)：设备资料依据、外部项目与论文调研、当前问题、目标架构、任务顺序和验收条件。
-- [LK-Mini-EEG16 运动想象实验操作手册](LK-Mini-EEG16运动想象实验操作手册.md)：面向新手的戴帽接线、OpenBCI GUI、BrainFlow/LSL、通道验证、被试提示、采集、训练、在线分类和排障步骤。
+- [LK-Mini-EEG16 运动想象实验操作手册](LK-Mini-EEG16运动想象实验操作手册.md)：当前 16 通道操作入口，包含新手戴帽接线、八通道迁移、OpenBCI GUI、BrainFlow/LSL、通道验证、被试提示、采集、训练、在线分类和排障步骤。
 
 ## 外部 Box 资料
 

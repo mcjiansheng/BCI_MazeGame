@@ -140,10 +140,11 @@ python scripts/verify_final_results.py --result outputs/bcic2b_se_mhaf_final.jso
 
 Unity 项目位于 Maze-game/，使用 Unity 2022.3.57f1c1。打开场景 [SampleScene.unity](Maze-game/Assets/Scenes/SampleScene.unity) 后点击 Play：
 
-- 默认生成 61 × 61 的完美迷宫，使用迭代 DFS；
+- 默认生成 15 × 15 的 3D 第一人称迷宫，使用迭代 DFS；
 - 起点为 (1, 1)，终点为 (width - 2, height - 2)；
-- WASD 或方向键移动，R 重新生成迷宫；
-- H 显示 BFS 最短路长度，V 切换全图 / 跟随视角；
+- 自动前进，唯一出口的拐角自动转向；分岔处留出 4 秒选择，有直行出口则到时直行，T 字路口等待左右选择；
+- A/D 或左右方向键预约相对左转/右转，S/↓ 掉头；死胡同默认自动掉头，可在设置中关闭；
+- Space 暂停，R 重建，H 路线提示，M/V 小地图；屏幕按钮支持同样的操作；
 - 外部控制监听 127.0.0.1:7777。
 
 接口和线程语义详见 [Unity BCI Maze 接口说明](Maze-game/Assets/README_BCI_Maze.md)。在线联调：
@@ -152,27 +153,51 @@ Unity 项目位于 Maze-game/，使用 Unity 2022.3.57f1c1。打开场景 [Sampl
 python scripts/run_bci_maze_integration.py --host 127.0.0.1 --port 7777
 ~~~
 
-该脚本读取 BCIC2a A01 的 E 测试数据和默认 Final checkpoint，把预测类别映射为方向并等待 Unity ACK。它是端到端冒烟测试，不是迷宫通关率评估；墙体阻挡、无效方向或模型预测错误都会导致某次命令未被接受。
+该脚本读取 BCIC2a A01 的 E 测试数据和默认 Final checkpoint，发送指令并等待 Unity ACK。新版 left/right 为相对转向，up/down 兼容为继续前进/掉头；accepted 表示指令已接受（可能仍在预约），不等于角色立即移动或模型正确。四分类可加 `--label-map configs/label_maps/bcic2a_relative.json`，将双脚映射为掉头。左右手二分类可直接控制新版。
+
+无 EEG 设备时，在 Unity Play 模式运行 `uv run scripts/validate_unity_maze.py`，可复核导航回归和真实 UDP 通关；详见 [3D 迷宫流程与验收](doc/UNITY_FIRST_PERSON_DEMO.md)。
 
 ## LK-Mini-EEG16 真实设备与受试者 MI
 
-仓库新增了 LK-Mini-EEG16 的真实采集链路，支持 BrainFlow 直连、OpenBCI GUI LSL、NPZ 回放和合成信号。首轮验证采用 8 个感觉运动区通道和左右手二分类 CSP+LDA：
+本地可视化控制台：双击根目录的 `bci-dashboard.cmd`，或运行 `bci-mi.cmd ui`。在浏览器中集中配置数据源、查看十六路波形与信号质量、启动采集和模型任务，并查询及控制 Unity 迷宫。操作流程、质量指标和电极接触检测的实现状态见 [实验控制台说明](doc/CONTROL_CONSOLE.md)。
+
+控制台的“05 / 子实验”提供真实左右握拳对照、带独立静息基线的运动想象采集与信号分析，以及按会话或采集分组评价的 CSP＋LDA 和标签置乱对照。支持已有记录分析、仿真演示与报告图像查看，详见[子实验操作与结果说明](doc/EXPERIMENTS.md)。
+
+2026-10-31 已完成 S01–S04 实际采集，保存 69 个真实握拳和 76 个运动想象完整试次，另有 2 个任务类型待确认的旧校准试次。16:02 所在的握拳记录及随后短想象记录已按操作者确认更正为 S03。逐次清单、恒定通道标记与恢复统计见[实际采集整理](doc/COLLECTION_20261031.md)。
+
+LK-Mini-EEG16 采集链路默认启用全部 16 个 EEG 通道，支持 BrainFlow Wi-Fi 直连、OpenBCI GUI LSL、NPZ 回放和合成信号。SE-MHAF Final 已接入公开预训练、个人微调和游戏路口控制；CSP+LDA 保留为对照。检查窗口显示 16 路波形及逐路质量，采集窗口显示中文动作提示、倒计时和异常电极。完整流程及已有模型见 [SE-MHAF 十六通道真机流程](doc/SE_MHAF_LIVE.md)。
+
+个人微调使用 `outputs/pretrained/lk_semhaf16.pt`。若本地尚无该文件，先按[公开预训练说明](doc/SE_MHAF_LIVE.md#公开预训练与预处理)准备 BCIC2a 数据，再运行：
+
+~~~powershell
+.\bci-mi.cmd pretrain --device cuda --epochs 100 --patience 20 --output outputs/pretrained/lk_semhaf16.pt
+~~~
 
 ~~~powershell
 # 1. 连接与通道质量检查
-python scripts/lk_mini_check.py --backend brainflow --duration 60
+.\bci-mi.cmd check --backend brainflow --duration 60
 
-# 2. 视觉提示下采集每类 40 个 trial
-python scripts/collect_lk_mi.py --subject S01 --backend brainflow --fullscreen
+# 2. 默认短轮：每类 10 次、2 组，约 3 分 45 秒
+.\bci-mi.cmd collect --subject S01 --session calibration01 --backend brainflow --preset short --fullscreen
 
-# 3. 训练受试者模型
-python scripts/train_lk_mi.py data/recordings/S01/<session>.npz --subject S01
+# 3. 从已保存的公开预训练模型进行个人微调
+.\bci-mi.cmd finetune data/recordings/S01/calibration01.npz --subject S01
 
-# 4. 实时滑窗分类
-python scripts/online_lk_mi.py --model outputs/subject_models/S01/csp_lda.joblib --backend brainflow --plot
+# 4. Unity 进入 Play 后，启动实时识别与路口控制
+.\bci-mi.cmd online --model outputs/subject_models/S01/semhaf16.pt --backend brainflow --unity-host 127.0.0.1 --plot
 ~~~
 
-默认通道顺序为 `FC3, FC4, C3, Cz, C4, CP3, CPz, CP4`，对应设备 CH1-CH8。模型会校验采样率和通道顺序；低置信度、类别概率差距不足或信号坏道时输出 `unknown`。详细接线、OpenBCI GUI/LSL 配置、运动想象方法、验收标准和排障见 [LK-Mini-EEG16 运动想象实验操作手册](doc/LK-Mini-EEG16运动想象实验操作手册.md)。外部调研与整体工作流见 [在线 MI 系统调研与实施工作流](doc/在线MI系统调研与实施工作流.md)。
+默认通道顺序为 `FC3,FC4,C3,Cz,C4,CP3,CPz,CP4,Fz,FC1,FCz,FC2,C5,C6,CP1,CP2`，依次对应 CH1-CH16，保留原 core-8 物理通道，默认 250 Hz。参考 SRB2 与 BIAS 不占 EEG 通道。模型会校验采样率和通道顺序；低置信度、类别概率差距不足或信号坏道时输出 `unknown`，但二分类模型没有可靠的静息检测能力。
+
+从八通道升级保持 CH1-CH8 不动，按表新增 CH9-CH16，再重新采集和训练；旧模型不能直接用于十六路输入。旧八通道记录仍可回放；复现旧布局需显式使用 `--channels 1,2,3,4,5,6,7,8 --channel-names FC3,FC4,C3,Cz,C4,CP3,CPz,CP4`。Mini-EEG08 串口诊断脚本 `test_mini_eeg_connection.py` 不适用于本 Wi-Fi 设备。
+
+本机已配置独立 `.venv-mi` 环境，使用 `bci-mi.cmd` 启动；`bci-mi.cmd demo` 打开仿真波形，`bci-mi.cmd check --backend brainflow` 检查真机。详见 [本机运行说明](doc/LOCAL_MI_SETUP.md)。
+
+BrainFlow 默认自动重连：连续 3 秒无有效样本或出现包序号异常时，程序清理独立采集工作进程并重新建立会话，设备恢复后继续收数。记录文件按连接会话分段；采集程序丢弃跨段试次，在线分类重新积累完整窗口与平滑历史。使用 `--no-auto-reconnect` 运行单次会话对照；参数和传输验收入口见 [连接恢复与传输验证](doc/LK_CONNECTION_RECOVERY.md)。
+
+面向初学者的接线、配置、MI 方法、完整命令、数据格式和排障见 [LK-Mini-EEG16 运动想象实验操作手册](doc/LK-Mini-EEG16运动想象实验操作手册.md)。历史调研见 [在线 MI 系统调研与实施工作流](doc/在线MI系统调研与实施工作流.md)，设备操作以当前手册为准。
+
+无设备时可执行 `python scripts/validate_lk_mini_workflow.py`，验证十六通道检查、合成采集、训练和独立在线回放。报告位于 `outputs/lk_mini_workflow/workflow_report.json`。实际设备采集结果见[实际采集整理](doc/COLLECTION_20261031.md)。
 
 ## 测试
 
@@ -181,6 +206,14 @@ python scripts/online_lk_mi.py --model outputs/subject_models/S01/csp_lda.joblib
 ~~~
 
 测试覆盖预处理、模型构造、形状约束、LK-Mini 设备命令、合成数据源、录制切片、信号质量、CSP+LDA 保存回载以及在线缓冲/拒识。涉及真实数据、真实硬件或 GPU 的实验不属于 pytest 的默认范围。
+
+可在没有 EEG 设备时运行完整的四阶段软件验收。它会依次启动通道检查、合成 MI 采集、受试者模型训练和独立记录的在线回放分类，并验证坏信号不会进入模型：
+
+~~~powershell
+python scripts/validate_lk_mini_workflow.py
+~~~
+
+结果和中间产物写入 `outputs/lk_mini_workflow/`。该命令使用合成输入检查采集、保存、训练和在线拒识。电极位置、阻抗、运动想象可分性和持续传输分别按实验手册采集现场记录。
 
 ## 目录结构
 
@@ -208,7 +241,7 @@ tmp/box-nju-1644522/          Box 下载资料（不提交）
 
 ## 已知边界与安全注意事项
 
-- 当前实验是 subject-dependent，尚未证明跨受试者泛化；不能把单受试者测试结果当作通用控制准确率。
+- 当前实验采用受试者内评价（subject-dependent），跨受试者泛化留待独立实验。
 - Unity 默认只监听回环地址且没有鉴权；若改为局域网监听，必须增加访问控制，并同步修改脚本、场景和文档。
 - Box 资料包含受试者安排、访谈文本、面部行为记录和其他敏感信息。下载目录在 tmp/ 下且被忽略；不要把原始资料、个人信息或外部项目结果复制进 Git。
 - 外部资料中的“测谎”标签协议、模型分数和报告指标没有被本项目验证；尤其不能把资料报告中的 91.6% 直接写成 BCI Maze 的结果。

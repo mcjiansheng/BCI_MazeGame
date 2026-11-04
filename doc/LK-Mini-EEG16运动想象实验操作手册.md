@@ -1,10 +1,14 @@
 # LK-Mini-EEG16 运动想象实验操作手册
 
-更新日期：2026-08-31
+当前设备配置为 16 通道。SE-MHAF 公开预训练、短轮采集、个人微调及 Unity 控制见 [SE-MHAF 真机流程](SE_MHAF_LIVE.md)。本手册保留接线、实验操作和 CSP＋LDA 对照方法。
+
+本机已配置独立的 `.venv-mi` 环境，直接使用项目根目录的 `bci-mi.cmd` 运行。入口和实测结果见 [本机运行说明](LOCAL_MI_SETUP.md)。下面安装段用于其他电脑；本机不必重新安装原来的 `.venv`。
 
 适用对象：第一次接触 EEG/脑机接口设备的小组成员
 
-首轮目标：使用 8 个感觉运动区通道，采集左右手运动想象，训练一名被试自己的 CSP+LDA 模型，并在 Python 中实时分类
+目标：使用 LK-Mini-EEG16 的全部 16 个 EEG 通道，采集左右手运动想象，训练一名被试自己的 CSP+LDA 模型，并在 Python 中实时分类。
+
+本手册是当前设备操作入口。设备连接依据仓库厂商通信协议；下面的头皮布局是本项目的建议接线约定，不是设备自动识别出的电极位置。旧文档中的“首轮 8 通道”流程已由本版本替代。16 个通道代表 16 个同步 EEG 测量位置，当前模型仍为左右手二分类。
 
 ## 1. 先理解这套系统在做什么
 
@@ -56,6 +60,8 @@ pip install -r requirements.txt
 pip install -e . --no-deps
 ```
 
+如果 PowerShell 禁止执行 `Activate.ps1`，不需要修改系统执行策略：直接用 `.\.venv\Scripts\python.exe -m pip ...` 安装，并把后续命令中的 `python` 换为 `.\.venv\Scripts\python.exe`。若没有 `py`，先安装 Python 3.11，并在安装时勾选 Tcl/Tk 支持；可运行 `python -m tkinter` 验证提示窗口组件。
+
 说明：
 
 - `brainflow`：Python 直接连接 LK-Mini；
@@ -73,51 +79,58 @@ python -c "import pylsl, numpy, scipy, sklearn; print('dependencies ok')"
 
 ## 4. 电极位置与接线
 
-### 4.1 首轮推荐 8 通道
+### 4.1 默认 16 通道接线表
 
-首次不要追求 16 通道和四分类。先用下面 8 个位置证明设备可以获得可分类的左右手 MI：
+按国际 10-10 扩展电极命名，将设备 CH1-CH16 接到下列头皮位置。`C` 表示中央区，`FC` 为额-中央区，`CP` 为中央-顶叶区；奇数通常位于左半球，偶数位于右半球，`z` 位于中线。C3/C4 及周围是左右手 MI 的主要观察区域。
 
 | LK-Mini 通道 | 10-20 位置 | 作用区域 |
 | ---: | --- | --- |
-| CH1 | FC3 | 左侧额-中央感觉运动区 |
-| CH2 | FC4 | 右侧额-中央感觉运动区 |
-| CH3 | C3 | 左侧主要感觉运动区，右手 MI 重点通道 |
-| CH4 | Cz | 中线感觉运动区 |
-| CH5 | C4 | 右侧主要感觉运动区，左手 MI 重点通道 |
-| CH6 | CP3 | 左侧中央-顶叶区 |
-| CH7 | CPz | 中线中央-顶叶区 |
-| CH8 | CP4 | 右侧中央-顶叶区 |
+| CH1 | FC3 | 原 core-8，左侧额-中央区 |
+| CH2 | FC4 | 原 core-8，右侧额-中央区 |
+| CH3 | C3 | 原 core-8，右手 MI 重点观察位置 |
+| CH4 | Cz | 原 core-8，中央中线 |
+| CH5 | C4 | 原 core-8，左手 MI 重点观察位置 |
+| CH6 | CP3 | 原 core-8，左侧中央-顶叶区 |
+| CH7 | CPz | 原 core-8，中央-顶叶中线 |
+| CH8 | CP4 | 原 core-8，右侧中央-顶叶区 |
+| CH9 | Fz | 新增，额中线辅助 |
+| CH10 | FC1 | 新增，左近中线额-中央区 |
+| CH11 | FCz | 新增，中央额区 |
+| CH12 | FC2 | 新增，右近中线额-中央区 |
+| CH13 | C5 | 新增，左外侧中央区 |
+| CH14 | C6 | 新增，右外侧中央区 |
+| CH15 | CP1 | 新增，左近中线中央-顶叶区 |
+| CH16 | CP2 | 新增，右近中线中央-顶叶区 |
 
-这个顺序会写入模型。以后只要交换了两根线，就必须修改 `--channel-names` 并重新训练模型。
+完整顺序为 `FC3,FC4,C3,Cz,C4,CP3,CPz,CP4,Fz,FC1,FCz,FC2,C5,C6,CP1,CP2`，与小组提供的布局图一致。该顺序会写入记录文件和模型。若接线与此表不同，必须同时修改 `--channels` 和 `--channel-names`，并让检查、采集和在线分类三处完全一致。模型不会自动推断或重排电极。
+
+这些“口”是头套上的电极位点，不是连接脑内的接口。先按头套印字核对位置，再沿线核对设备插口；不能仅凭电极线颜色判断。若头套没有 FC1/FC2、C5/C6 等位置，应按实际位置制定新映射，不可把别处的电极改名冒充。
 
 ### 4.2 参考与 BIAS
 
-除了 8 个 EEG 采集电极，还需要共同参考和 BIAS：
+除了 16 个 EEG 采集电极，还需要共同参考和 BIAS，参考/BIAS 不计入 16 通道：
 
 - `SRB2`：共同参考，建议接左耳垂 A1；
 - `BIAS`：共模噪声抑制，建议接右耳垂 A2；
 - EEG 通道使用 Normal 输入，BIAS 打开、SRB2 打开、SRB1 关闭。
 
-如果头套线束已经把参考/BIAS 集成到专用接口，按厂商标识接入。不要把 SRB2 或 BIAS 当成 CH1-CH8，也不要凭线的颜色猜接口。
+如果头套线束已经把参考/BIAS 集成到专用接口，按厂商标识接入。不要把 SRB2 或 BIAS 当成 CH1-CH16，也不要凭线的颜色猜接口。新提供的 `LK-Mini-EEG16/LK-Mini-EEG16 使用说明书 20260716.pdf` 第 4 页明确标注 CH1-CH8 使用 N 输入端，SRB2 接帽上参考 REF（原文写 RFE），BIAS 接帽上 GND。该页图只明确画出前八路，CH9-CH16 和两组参考的线束关系仍应按实物标识或厂家确认，不自行短接未知插口。
 
 该连接方式与 [OpenBCI EEG setup](https://docs.openbci.com/GettingStarted/Biosensing-Setups/EEGSetup/) 和 [OpenBCI ExG setup](https://docs.openbci.com/GettingStarted/Biosensing-Setups/ExGSetup/) 的共同参考方案一致。
 
-### 4.3 可选 16 通道扩展
+### 4.3 从旧 8 通道实验迁移
 
-二分类闭环稳定后，可改用：
+升级后的默认值会启用全部 16 路。**必须重新采集并训练 16 通道模型**；不能给旧数据补零、复制通道，或只修改旧模型的通道名称。
 
-| CH | 位置 | CH | 位置 |
-| ---: | --- | ---: | --- |
-| 1 | Fz | 9 | Cz |
-| 2 | FC3 | 10 | C4 |
-| 3 | FC1 | 11 | C6 |
-| 4 | FCz | 12 | CP3 |
-| 5 | FC2 | 13 | CP1 |
-| 6 | FC4 | 14 | CPz |
-| 7 | C5 | 15 | CP2 |
-| 8 | C3 | 16 | CP4 |
+旧布局 CH1-CH8=`FC3,FC4,C3,Cz,C4,CP3,CPz,CP4` 原封不动保留；只需按 4.1 表把新增八个位置接到 CH9-CH16，不要重排前八根线。虽然 core-8 物理通道保持不变，十六通道 CSP 模型仍需重新采集训练。保留原始八通道记录和模型，给新实验使用独立 session 和模型路径。前一版以 Fz 开头的十六通道模型与当前顺序不兼容，不能只修改标签后加载。
 
-扩展后必须重新采集和训练，不能把 8 通道模型用于 16 通道输入。
+如果要在 LK-Mini-EEG16 上复现旧八电极布局，检查、采集和在线命令都显式附加：
+
+```powershell
+--channels 1,2,3,4,5,6,7,8 --channel-names FC3,FC4,C3,Cz,C4,CP3,CPz,CP4
+```
+
+这只用于八通道兼容实验，会关闭后八路。回放旧 NPZ 时读取文件实际通道元数据，八通道文件仍可训练八通道模型；八与十六通道会话不能混合训练。旧 `test_mini_eeg_connection.py --port COMx` 是 Mini-EEG08 串口诊断脚本，不适用于本设备的 Wi-Fi 流程。
 
 ## 5. 给被试戴帽
 
@@ -148,7 +161,16 @@ python -c "import pylsl, numpy, scipy, sklearn; print('dependencies ok')"
 
 ## 6. OpenBCI GUI 中的第一次连接
 
-### 6.1 连接设备 Wi-Fi
+### 6.1 连接设备网络
+
+本机使用厂商 USB 路由器的 STA 方式。依据 `LK-Mini-EEG16/LK-Mini-EEG16 使用说明书 20260716.pdf` 第 7 页：
+
+1. 插入厂商 USB 接收器；Windows 设备名为 `Corechip SR9900 USB2.0 to Fast Ethernet Adapter`，驱动安装包为 `SR9900_SFX.EXE`。本机已经识别该适配器，无需重复安装。
+2. 打开 LK-Mini。设备自动连接接收器提供的 `LK-USB-Mini-EEG16` 网络，默认密码 `12345678`，设备固定 IP 为 `192.168.4.1`。
+3. 本机设备侧地址为 `192.168.4.2`，网关为 `192.168.4.254`。内置无线网卡同时连接校园网属于正常情况，不必切断校园网。
+4. 蓝灯慢闪表示已连接路由器但未连接采集软件，常亮表示已连接软件。
+
+仅在选择说明书第 8 页的 AP 直连方式时，执行以下步骤：
 
 1. 打开 LK-Mini-EEG16。
 2. 在 Windows Wi-Fi 中连接 SSID `LK-Mini-EEG16`。
@@ -166,10 +188,12 @@ python -c "import pylsl, numpy, scipy, sklearn; print('dependencies ok')"
 5. 采样率选择 `250 Hz`；
 6. 启动会话后打开 Time Series；
 7. Hardware Settings 中实际使用通道设置为：Normal、BIAS On、SRB2 On、SRB1 Off；
-8. 未使用的通道关闭；
+8. CH1-CH16 全部开启，按 4.1 表核对标签；
 9. 初始 PGA Gain 使用 x24。若接触已确认正常但仍 Railed，再尝试 x12 或 x8。
 
 注意：厂商通信协议的表格和示例有一处文字矛盾，但厂商 Python 示例与命令表均使用 `~6` 设置 250 Hz，本项目也采用该命令。
+
+不要将普通 Cyton+Daisy 串口的采样率经验直接套用到本 Wi-Fi 设备。这里 250 Hz 指每路每秒 250 点，16 路的一个 4 秒 trial 是 `16 × 1000`，不是把 250 除以 16。最终还应通过 Python 的时间戳检查确认实测速率。
 
 ### 6.3 阻抗检查
 
@@ -188,7 +212,7 @@ python -c "import pylsl, numpy, scipy, sklearn; print('dependencies ok')"
 3. Python 质量检查不报告 `bad`；
 4. 线缆轻微静止后基线稳定。
 
-若全部通道都同时显示很大阻抗，先检查 SRB2、BIAS 和共同参考，而不是逐个怀疑 8 个头皮电极。
+若全部通道都同时显示很大阻抗，先检查 SRB2、BIAS 和共同参考。若只有 CH9-CH16 异常，重点检查后八路线束、通道使能和该组参考连接。
 
 ## 7. 两种 Python 接入方式
 
@@ -201,8 +225,8 @@ python scripts/lk_mini_check.py `
   --backend brainflow `
   --ip-address 192.168.4.1 --ip-port 12345 `
   --sample-rate 250 --gain 24 `
-  --channels 1,2,3,4,5,6,7,8 `
-  --channel-names FC3,FC4,C3,Cz,C4,CP3,CPz,CP4 `
+  --channels 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 `
+  --channel-names FC3,FC4,C3,Cz,C4,CP3,CPz,CP4,Fz,FC1,FCz,FC2,C5,C6,CP1,CP2 `
   --duration 60 `
   --output data/recordings/S01/device_check.npz
 ```
@@ -211,11 +235,14 @@ python scripts/lk_mini_check.py `
 
 - 通过 BrainFlow 的 Cyton+Daisy Wi-Fi 板卡连接；
 - 发送 `~6` 设置 250 Hz；
-- 启用 CH1-CH8、关闭 CH9-CH16；
-- 实时显示 8 条波形；
+- 启用 CH1-CH16；
+- 分两列实时显示 16 条波形，逐路标注设备 CH、电极名与 good/warning/bad；
+- 波形仅在显示时去中位数并错开，保存的原始 EEG 不受影响；
 - 每 2 秒输出 RMS、峰峰值、平线比例和 50 Hz 干扰比例；
 - 结束时报告实际收到的样本数和有效采样率，偏离目标超过 15% 时返回失败；
 - 正常退出时释放设备会话。
+
+上述通道和名称就是默认值，按标准接线后可省略两项。检查窗口关闭或按 Ctrl+C 会结束检查并保存已收到的数据。终端还会检查时间戳是否递增、有无采样间隙；质量或采样检查失败时返回非零退出码。终端 `good` 只代表未触发当前信号阈值，不能证明物理接线位置正确，也不能证明已有可识别的 MI。
 
 ### 7.2 方式 B：OpenBCI GUI 通过 LSL 转发（联调推荐）
 
@@ -236,27 +263,29 @@ python scripts/lk_mini_check.py `
 python scripts/lk_mini_check.py `
   --backend lsl --lsl-name LKMiniEEG `
   --sample-rate 250 `
-  --channels 1,2,3,4,5,6,7,8 `
-  --channel-names FC3,FC4,C3,Cz,C4,CP3,CPz,CP4 `
+  --channels 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 `
+  --channel-names FC3,FC4,C3,Cz,C4,CP3,CPz,CP4,Fz,FC1,FCz,FC2,C5,C6,CP1,CP2 `
   --duration 60
 ```
 
 如果 GUI 的 LSL 名称不确定，省略 `--lsl-name`，程序会搜索第一个 `type=EEG` 的流。实验室同时有多个 LSL EEG 流时必须指定名称。
 
+LSL 必须输出全部 16 路 EEG，单位为 µV，顺序与接线表一致，采样率为 250 Hz。代码检查流的采样率和通道数量，但不会根据 LSL 标签自动改名，也不自动将 V 换算为 µV。如果 GUI 输出包含 AUX/加速度计，确认选择的是 16 个 EEG 列。这里只配置 Python 订阅端，硬件使能和增益仍由 GUI 设置。
+
 ## 8. 如何确认通道真的接对了
 
-Python 只能检测通道是否平线、饱和或噪声过大，不能从一小段 EEG 自动知道“CH3 的线是否真的插在 C3”。需要人工完成映射验证：
+Python 只能检测平线、幅值异常和噪声，不能从一小段 EEG 自动知道“CH3 的线是否真的插在 C3”。需要人工完成映射验证：
 
 1. 打开实时波形；
-2. 操作员依次轻触/轻压 FC3、FC4、C3、Cz、C4、CP3、CPz、CP4 附近的电极固定件；
+2. 先按 4.1 的 16 行表逐根追踪电极标签和设备插口，逐项记录；可在厂商允许的前提下依次轻触电极固定件辅助观察；
 3. 每次只动一个位置，不拔线，不触碰裸露导体；
-4. 对应通道应出现最大的瞬态变化；
+4. 对应通道可能出现明显瞬态变化，但共同参考和线缆牵动也会影响其他通道，不能仅凭“哪一路变化最大”判断接线；
 5. 若另一个通道变化最大，检查线束标签和 `--channel-names`；
 6. 测试结束后等待波形恢复稳定，再采 MI。
 
 附加测试：
 
-- 被试连续眨眼时，额区通道通常更明显；本项目 8 通道以中央区为主，不能把眨眼测试当作全部通道的定位证据；
+- 被试连续眨眼时，Fz 等额区通道通常更明显；不能把眨眼测试当作全部 16 路的定位证据；
 - 咬牙会产生广泛高频肌电，只用于确认系统对伪迹有响应，不能作为 EEG 有效性的证据；
 - 睁眼/闭眼 α 差异在枕区最明显，本项目没有 O1/O2，所以中央区变化不明显也不代表设备故障。
 
@@ -285,6 +314,8 @@ Python 只能检测通道是否平线、饱和或噪声过大，不能从一小�
 | 开始运动想象 | 4 s | 持续进行对应动觉想象 |
 | 休息 | 随机 2-3 s | 停止想象，可以自然眨眼和放松 |
 
+每个 block 结束后额外休息 30 秒，可用 `--block-rest-seconds` 调整。16 通道不要求被试分别“激活 16 个位置”：被试始终只完成屏幕指定的左手或右手动觉想象。
+
 正式采集前做 5-10 次不保存的练习。操作员观察手指、前臂、下颌和肩膀，确认没有实际运动。
 
 ## 10. 采集左右手 MI 校准数据
@@ -296,8 +327,8 @@ python scripts/collect_lk_mi.py `
   --subject S01 `
   --backend brainflow `
   --sample-rate 250 --gain 24 `
-  --channels 1,2,3,4,5,6,7,8 `
-  --channel-names FC3,FC4,C3,Cz,C4,CP3,CPz,CP4 `
+  --channels 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 `
+  --channel-names FC3,FC4,C3,Cz,C4,CP3,CPz,CP4,Fz,FC1,FCz,FC2,C5,C6,CP1,CP2 `
   --classes left_hand,right_hand `
   --trials-per-class 40 --blocks 4 `
   --fullscreen
@@ -313,7 +344,7 @@ python scripts/collect_lk_mi.py `
 
 - 全屏显示准备、箭头、运动想象和休息；
 - 显示 block/trial 和剩余时间；
-- 底部显示实时通道质量摘要；
+- 底部显示 `good 通道数/16`，并列出 warning/bad 电极名称；等待数据时显示等待状态；
 - 操作员发现真实动作、说话、咳嗽或明显线缆扰动时按 `A`，当前 trial 会被标记为伪迹；
 - 按 `Esc` 安全提前结束，已完成 trial 仍会保存。
 
@@ -324,6 +355,10 @@ data/recordings/S01/<session>.npz
 ```
 
 文件包含原始连续 EEG、4 秒 trial、标签、block、伪迹标记、采样率、通道顺序和参数。该目录已被 Git 忽略。
+
+上方命令显式指定完整采集方案，共 80 个 trial，分 4 个 block，每组左右手各 10 次、组内随机。当前省略次数参数时采用 `--preset short`，共 20 次、2 组，约 3 分 45 秒；`standard` 为 40 次、4 组，`full` 为上述完整方案。每次使用新的 session/输出文件名；被试先看方向，等“开始运动想象”后再开始。操作员标记伪迹，后续训练排除已标记试次。信号异常时可按 Esc 结束，改善接触后采集新会话。
+
+无设备熟悉被试界面可运行 `python scripts/collect_lk_mi.py --subject PRACTICE --backend synthetic --trials-per-class 2 --blocks 1`。这会生成仿真记录，不能混入真人 S01 的训练数据。`--simulate-mi` 是跳过界面的自动化验收模式，与被试练习窗口不同。
 
 ## 11. 训练该被试的识别模型
 
@@ -354,12 +389,20 @@ python scripts/train_lk_mi.py `
 - 输出 8-13 Hz 与 13-30 Hz 各通道的类别效应量；
 - 计算当前 trial 数量下二分类机会水平的 95% 上界。
 
+数据维度和处理细节：连续 EEG 为 `16 × 样本数`；默认 trial 为 `16 × 1000`；80 次完整 trial 为 `80 × 16 × 1000`。训练从 NPZ 读取采样率和电极名，无需再指定 `--channels`。带通使用四阶 Butterworth SOS，逐 trial 双向滤波；CSP 在全部 16 路上拟合正则化协方差，再输出默认 4 个空间分量的归一化对数方差，交给 LDA。4 个 CSP 分量不等于只使用 4 个采集电极，不必因通道翻倍就把分量改成 16。
+
+每折只用训练折拟合 CSP/LDA，在线调用保存的同一滤波及分类 pipeline。这里没有自动 ICA、自动插值坏道或独立 50 Hz 陷波；7-30 Hz 带通会抑制带外成分，工频质量指标则在原始信号上计算。明显坏试次应由操作员标记排除，不应靠增加电极数量掩盖伪迹。
+
+报告包含 `channel_count: 16`、有序 `channel_names` 和每个电极的 μ/β 效应量。该效应量是左右手 trial 的类别差异，不是相对于准备期的 ERD 百分比。默认模型是重新用全部保留 trial 拟合的最终模型；交叉验证指标不是此模型在新被试上的保证。训练未超过报告阈值时仍保存模型/报告，但返回退出码 3，需先排障和复测。
+
 默认模型位置：
 
 ```text
 outputs/subject_models/S01/csp_lda.joblib
 outputs/subject_models/S01/csp_lda.json
 ```
+
+如已有八通道同名模型，训练时使用 `--output outputs/subject_models/S01/csp_lda_16ch.joblib`，在线命令的 `--model` 也指向此文件，以保留旧模型。省略 `--output` 会写入上面的默认路径，已有同名文件会被覆盖。
 
 ### 怎样判断“获得了切实有效的 MI 数据”
 
@@ -381,8 +424,8 @@ python scripts/online_lk_mi.py `
   --model outputs/subject_models/S01/csp_lda.joblib `
   --backend brainflow `
   --sample-rate 250 --gain 24 `
-  --channels 1,2,3,4,5,6,7,8 `
-  --channel-names FC3,FC4,C3,Cz,C4,CP3,CPz,CP4 `
+  --channels 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 `
+  --channel-names FC3,FC4,C3,Cz,C4,CP3,CPz,CP4,Fz,FC1,FCz,FC2,C5,C6,CP1,CP2 `
   --step-seconds 0.5 `
   --confidence 0.65 --margin 0.15 `
   --plot
@@ -392,10 +435,12 @@ python scripts/online_lk_mi.py `
 
 - 概率不足 0.65：`unknown`；
 - 第一、第二类别差距不足 0.15：`unknown`；
-- 信号存在明显坏道：`unknown`；
+- 任一路信号为 warning/bad（包括严重工频污染）：`unknown`；
 - 模型与输入采样率/通道顺序不一致：直接报错并停止。
 
 日志保存在 `outputs/online/`。所有 `unknown` 都不会发送移动。
+
+概率图标题显示模型通道数和被试编号；坏道名单分行显示，包含 CH9-CH16 对应电极。首次需要收满 4 秒窗，默认 3 窗平滑还需再更新两次，通常约 5 秒后才可能输出首个接受结果。左右手二分类没有训练“静息”类别，因此 **unknown 不是可靠的静息检测**：不做 MI 时也可能输出高置信度左右手。连接游戏前须测量静息误触发率，并由操作员控制实验开始/结束。
 
 可选连接 Unity：
 
@@ -403,8 +448,8 @@ python scripts/online_lk_mi.py `
 python scripts/online_lk_mi.py `
   --model outputs/subject_models/S01/csp_lda.joblib `
   --backend brainflow `
-  --channels 1,2,3,4,5,6,7,8 `
-  --channel-names FC3,FC4,C3,Cz,C4,CP3,CPz,CP4 `
+  --channels 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 `
+  --channel-names FC3,FC4,C3,Cz,C4,CP3,CPz,CP4,Fz,FC1,FCz,FC2,C5,C6,CP1,CP2 `
   --unity-host 127.0.0.1 --unity-port 7777 `
   --command-cooldown 1.5 --plot
 ```
@@ -412,6 +457,14 @@ python scripts/online_lk_mi.py `
 当前映射是左手=`left`、右手=`right`。Unity 最终应采用“相对左转/右转或岔路选择”，而不是把它们解释成世界坐标的永远向左/向右。
 
 ## 13. 无设备回放和开发
+
+一键运行“通道检查 -> MI 采集文件 -> 预处理/训练 -> 独立在线回放分类”的完整软件验收：
+
+```powershell
+python scripts/validate_lk_mini_workflow.py
+```
+
+该验收使用显式标记的 16 通道合成 MI 数据，输出位于 `outputs/lk_mini_workflow/`。`workflow_report.json` 必须包含 `status: passed`、`device_contract.channel_count: 16`，且所有 checks 为 true。通过表示四个命令行入口、NPZ 元数据、CSP+LDA 保存回载、在线窗口、EOF 退出和坏道拒识能够协同工作；它不替代真实设备的 Wi-Fi、阻抗、物理通道位置、持续采样率和真人 MI 有效性验收。合成信号的分类差异是人为构造的，不模拟或证明真实脑区生理分布。
 
 检查 UI/脚本：
 
@@ -437,6 +490,7 @@ python scripts/lk_mini_check.py `
 | 找不到 LSL stream | GUI Networking 是否启动；类型是否 EEG；Time Series Widget 是否打开；名称是否与 `--lsl-name` 一致 |
 | 16 个通道全部阻抗很大 | 先查 SRB2、BIAS、耳垂接触和公共线束，不要先重做所有头皮电极 |
 | 某个通道平线 | 通道是否被关闭；线是否插错；电极是否接触头皮；对应线缆是否损坏 |
+| 只有后 8 路平线/缺失 | 是否仍使用旧八通道参数；GUI 是否选 16 路；CH9-CH16 是否启用；后八路线束与参考连接 |
 | Railed | 接触不良、参考脱落或增益过高；先改善接触，再将 x24 降到 x12/x8 |
 | 50 Hz 很强 | BIAS/参考、线缆摆动、附近电源/充电器、接地环境；不要只靠陷波掩盖问题 |
 | 采集 trial 数量不足 | 检查流是否中断；4 秒阶段内是否实际收到 1000 个样本；不要强行补零 |
@@ -450,11 +504,11 @@ python scripts/lk_mini_check.py `
 
 - [ ] 已获得知情同意并使用匿名 ID；
 - [ ] 头套位置正确、被试舒适；
-- [ ] CH1-CH8 映射已记录；
+- [ ] CH1-CH16 映射逐路确认并记录，尤其 CH3=C3、CH5=C4，前八路与原实验一致；
 - [ ] SRB2 和 BIAS 已确认；
 - [ ] 阻抗检查完成并退出阻抗模式；
 - [ ] 普通波形无 Railed/平线；
-- [ ] Python 8 个通道均收到数据；
+- [ ] Python 16 个通道均收到数据，实测采样率与时间戳检查通过；
 - [ ] 被试完成 5-10 个练习 trial；
 - [ ] 提醒被试在 4 秒想象期间不动、不说话、不咬牙；
 - [ ] 输出目录有足够空间。
@@ -469,6 +523,10 @@ python scripts/lk_mini_check.py `
 - [ ] 未超过机会水平时不进入游戏控制实验。
 
 ## 16. 主要参考
+
+本机实测发现 BrainFlow 的 Wi-Fi 时间戳按网络批量到达，间隔不代表 ADC 采样间隔。直连路径现在先校验拼帧后设备包序号按 0-255 循环递增，再建立等间隔样本时间轴；诊断 NPZ 同时保存原始 `received_timestamps` 用于实测速率检查。真实序号跳变会停止采集/在线分析，不把断流两侧拼成有效窗口。LSL 和回放按提供的样本时间戳检查间断；回放保留原始间隔，不再掩盖旧记录中的缺口。BrainFlow 5.22.2 已根据各通道配置增益返回微伏值，Python 不再额外缩放。先前带 `24/gain` 补偿的 x6 诊断幅值偏大四倍，应重新测量；x24 不受该问题影响。
+
+采集连续 5 秒无数据会报错，已完成试次仍保存。无设备自动生成数据使用 `--simulate-mi`；视觉采集禁止 `--no-realtime`，以免快速生成的样本和屏幕提示不同步。训练发现 NaN/Inf 会报错，不能静默转成零信号。当前二分类训练器只接受两个任务类别。
 
 - [LK-Mini-EEG16 厂商通信协议与示例](../vendor/LK-Mini-EEG16/README.md)
 - [BrainFlow Python examples](https://brainflow.readthedocs.io/en/stable/Examples.html)

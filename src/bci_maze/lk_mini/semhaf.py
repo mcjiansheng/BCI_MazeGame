@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Sequence
 
 import numpy as np
@@ -12,6 +13,7 @@ import torch
 
 from ..models import build_model
 from ..preprocessing import FILTER_BANK_BANDS, make_filter_bank
+from ..stopping import defer_stop
 from .source import DEFAULT_CHANNEL_NAMES
 
 MODEL_NAME = "se_mhaf_conformer_final_logvar"
@@ -68,7 +70,10 @@ def public_channel_indices(channel_names: Sequence[str]) -> list[int]:
 
 
 def filter_epochs(epochs: np.ndarray) -> np.ndarray:
-    values = validate_epochs(epochs, 250, DEFAULT_CHANNEL_NAMES)
+    return _filter_validated_epochs(validate_epochs(epochs, 250, DEFAULT_CHANNEL_NAMES))
+
+
+def _filter_validated_epochs(values: np.ndarray) -> np.ndarray:
     # CAR uses precisely the same 16 electrodes on both acquisition systems.
     referenced = values - values.mean(axis=1, keepdims=True)
     return make_filter_bank(referenced, sfreq=250.0, zero_phase=False)
@@ -83,7 +88,7 @@ def fit_normalization(filtered: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return mean, np.maximum(std, 1e-6)
 
 
-def preprocessing_metadata() -> dict:
+def _preprocessing_contract() -> dict:
     return {
         "input_units": "uV", "reference": "CAR", "reference_channels": list(DEFAULT_CHANNEL_NAMES),
         "bands_hz": [list(band) for band in FILTER_BANK_BANDS],
@@ -91,6 +96,11 @@ def preprocessing_metadata() -> dict:
         "transition_hz": 2.0, "causal": True, "state": "zero_at_each_window",
         "normalization": "training_trials_per_band_per_channel_mean_std",
     }
+
+
+def preprocessing_metadata() -> dict:
+    """Describe the algorithm and any additional notes stored with the model."""
+    return _preprocessing_contract()
 
 
 @dataclass
@@ -119,7 +129,7 @@ class SEMHAFBundle:
 
     def predict_proba(self, epoch: np.ndarray, sample_rate: int, channel_names: Sequence[str]) -> np.ndarray:
         values = self.validate_input(epoch, sample_rate, channel_names)
-        filtered = filter_epochs(values)
+        filtered = _filter_validated_epochs(values)
         normalized = (filtered - self.mean) / self.std
         self.model.eval()
         with torch.inference_mode():
@@ -134,6 +144,7 @@ def new_bundle(*, device: str = "auto", subject_id: str = "public", metadata: di
                         metadata or {}, {}, target)
 
 
+@defer_stop()
 def save_semhaf_bundle(bundle: SEMHAFBundle, path: str | Path) -> Path:
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -142,18 +153,23 @@ def save_semhaf_bundle(bundle: SEMHAFBundle, path: str | Path) -> Path:
         "format": FORMAT, "model_name": MODEL_NAME,
         "config": asdict(bundle.config), "channel_names": list(bundle.channel_names),
         "classes": list(bundle.classes), "subject_id": bundle.subject_id,
-        "preprocessing": preprocessing_metadata(),
+        "preprocessing": json.loads(json.dumps(preprocessing_metadata())),
         "model": {key: value.detach().cpu() for key, value in bundle.model.state_dict().items()},
         "norm_mean": torch.from_numpy(bundle.mean.copy()), "norm_std": torch.from_numpy(bundle.std.copy()),
         "metadata": json.loads(json.dumps(bundle.metadata)),
         "training_report": json.loads(json.dumps(bundle.training_report)),
     }
-    temporary = destination.with_suffix(destination.suffix + ".tmp")
-    torch.save(payload, temporary)
-    temporary.replace(destination)
-    destination.with_suffix(".json").write_text(json.dumps({
-        key: value for key, value in payload.items() if key not in {"model", "norm_mean", "norm_std"}
-    }, ensure_ascii=False, indent=2), encoding="utf-8")
+    sidecar = destination.with_suffix(".json")
+    with TemporaryDirectory(dir=destination.parent) as staging_dir:
+        staging = Path(staging_dir)
+        temporary_checkpoint = staging / "checkpoint.pt"
+        temporary_sidecar = staging / "checkpoint.json"
+        torch.save(payload, temporary_checkpoint)
+        temporary_sidecar.write_text(json.dumps({
+            key: value for key, value in payload.items() if key not in {"model", "norm_mean", "norm_std"}
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary_checkpoint.replace(destination)
+        temporary_sidecar.replace(sidecar)
     return destination
 
 
@@ -161,12 +177,17 @@ def load_semhaf_bundle(path: str | Path, device: str = "auto") -> SEMHAFBundle:
     checkpoint = torch.load(path, map_location="cpu", weights_only=True)
     if checkpoint.get("format") != FORMAT or checkpoint.get("model_name") != MODEL_NAME:
         raise ValueError("Expected an lk_semhaf16_v1 checkpoint; pretrain/finetune with the LK scripts")
-    if checkpoint.get("config") != asdict(SEMHAFConfig()):
+    config = checkpoint.get("config", {})
+    if not isinstance(config, dict) or any(config.get(key) != value for key, value in asdict(SEMHAFConfig()).items()):
         raise ValueError("Checkpoint sample rate/window differs from the LK contract")
     if tuple(checkpoint.get("channel_names", [])) != DEFAULT_CHANNEL_NAMES or tuple(checkpoint.get("classes", [])) != CLASSES:
         raise ValueError("Checkpoint channel order or classes differ from the LK contract")
-    if checkpoint.get("preprocessing") != preprocessing_metadata():
-        raise ValueError("Checkpoint preprocessing differs from the LK contract")
+    preprocessing = checkpoint.get("preprocessing", {})
+    if not isinstance(preprocessing, dict):
+        raise ValueError("Checkpoint preprocessing must be a dictionary")
+    for key, value in _preprocessing_contract().items():
+        if preprocessing.get(key) != value:
+            raise ValueError(f"Checkpoint preprocessing differs from the LK contract: {key}")
     bundle = new_bundle(device=device, subject_id=str(checkpoint["subject_id"]), metadata=checkpoint["metadata"])
     bundle.model.load_state_dict(checkpoint["model"], strict=True)
     bundle.mean = checkpoint["norm_mean"].numpy().astype(np.float32)

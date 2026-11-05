@@ -11,6 +11,7 @@ from pathlib import Path
 
 import numpy as np
 
+from bci_maze.stopping import defer_stop
 from bci_maze.lk_mini.cli import add_source_arguments, source_from_args
 from bci_maze.lk_mini.quality import assess_signal_quality
 from bci_maze.lk_mini.recording import (
@@ -219,6 +220,7 @@ def collection_configuration(args: argparse.Namespace, timing: dict, total_trial
         "device_channels_1_based": [value + 1 for value in args.channels],
         "prepare_seconds": args.prepare_seconds,
         "cue_seconds": args.cue_seconds,
+        "task": "motor_imagery",
         "imagery_seconds": args.imagery_seconds,
         "rest_range_seconds": [args.rest_min, args.rest_max],
         "warmup_seconds": args.warmup_seconds,
@@ -326,6 +328,48 @@ def main() -> int:
     recording_traceback = None
     recorder = ContinuousRecorder(source)
 
+    @defer_stop()
+    def finalize():
+        continuous, timestamps = recorder.snapshot()
+        display.close()
+
+        if not epochs and not discarded_trials:
+            if recording_error is not None:
+                raise recording_error.with_traceback(recording_traceback)
+            print("没有完成的 trial，未写入记录文件。")
+            return 2
+        destination = save_mi_recording(
+            output,
+            continuous=continuous,
+            timestamps=timestamps,
+            epochs=np.stack(epochs) if epochs else np.empty((0, len(actual_channel_names), int(round(args.imagery_seconds * actual_sample_rate)))),
+            labels=labels,
+            trials=trials,
+            sample_rate=actual_sample_rate,
+            channel_names=actual_channel_names,
+            subject_id=args.subject,
+            session_id=args.session,
+            segment_ids=recorder.snapshot_segment_ids(),
+            received_timestamps=recorder.snapshot_received_timestamps(),
+            discarded_trials=discarded_trials,
+            recovery_stats=dict(getattr(source, "recovery_stats", {})),
+            recovery_events=list(getattr(source, "recovery_events", [])),
+            configuration={
+                **configuration,
+                "sample_rate": actual_sample_rate,
+                "lsl_max_sample_gap_seconds": getattr(source, "max_sample_gap", None),
+            },
+        )
+        print(
+            f"已保存 {len(epochs)} 个 trial 到 {destination}；"
+            f"有效（未标记伪迹）{sum(not trial.artifact for trial in trials)} 个，"
+            f"伪迹标记 {sum(trial.artifact for trial in trials)} 个，断流或中断丢弃 {len(discarded_trials)} 个。"
+        )
+        if recording_error is not None:
+            print("采集发生异常；以上已完成 trial 已作为部分记录安全保存。")
+            raise recording_error.with_traceback(recording_traceback)
+        return 3 if discarded_trials else 0
+
     try:
         with recorder:
             actual_sample_rate = int(source.sample_rate)
@@ -422,30 +466,31 @@ def main() -> int:
                     round(args.imagery_seconds * actual_sample_rate)
                 )
                 ready = recorder.wait_for_samples(stop_sample, timeout=2.0, segment_id=trial_segment)
-                if not ready:
-                    reason = "stream_interrupted" if recorder.recovering or recorder.segment_id != trial_segment else "insufficient_samples"
-                    discarded_trials.append({**active_trial, "reason": reason, "stop_sample": recorder.sample_count})
-                    print(f"Trial {trial_index + 1} 已丢弃：{reason}；保留此前完成的 trial。")
-                else:
-                    try:
-                        epoch = recorder.segment(start_sample, stop_sample, segment_id=trial_segment)
-                    except ValueError as exception:
-                        discarded_trials.append({**active_trial, "reason": "segment_boundary", "detail": str(exception)})
+                with defer_stop():
+                    if not ready:
+                        reason = "stream_interrupted" if recorder.recovering or recorder.segment_id != trial_segment else "insufficient_samples"
+                        discarded_trials.append({**active_trial, "reason": reason, "stop_sample": recorder.sample_count})
+                        print(f"Trial {trial_index + 1} 已丢弃：{reason}；保留此前完成的 trial。")
                     else:
-                        trial = TrialRecord(
-                            trial_index=trial_index,
-                            block=block,
-                            label=label,
-                            start_sample=start_sample,
-                            stop_sample=stop_sample,
-                            cue_monotonic=cue_time,
-                            artifact=display.consume_artifact(),
-                            segment_id=trial_segment,
-                        )
-                        trials.append(trial)
-                        epochs.append(epoch)
-                        labels.append(label)
-                active_trial = None
+                        try:
+                            epoch = recorder.segment(start_sample, stop_sample, segment_id=trial_segment)
+                        except ValueError as exception:
+                            discarded_trials.append({**active_trial, "reason": "segment_boundary", "detail": str(exception)})
+                        else:
+                            trial = TrialRecord(
+                                trial_index=trial_index,
+                                block=block,
+                                label=label,
+                                start_sample=start_sample,
+                                stop_sample=stop_sample,
+                                cue_monotonic=cue_time,
+                                artifact=display.consume_artifact(),
+                                segment_id=trial_segment,
+                            )
+                            trials.append(trial)
+                            epochs.append(epoch)
+                            labels.append(label)
+                    active_trial = None
 
                 rest = rng.uniform(args.rest_min, args.rest_max)
                 progress = (
@@ -467,43 +512,8 @@ def main() -> int:
         if active_trial is not None:
             discarded_trials.append({**active_trial, "reason": "capture_error", "detail": str(exception)})
     finally:
-        continuous, timestamps = recorder.snapshot()
-        display.close()
-
-    if not epochs and not discarded_trials:
-        if recording_error is not None:
-            raise recording_error.with_traceback(recording_traceback)
-        print("没有完成的 trial，未写入记录文件。")
-        return 2
-    destination = save_mi_recording(
-        output,
-        continuous=continuous,
-        timestamps=timestamps,
-        epochs=np.stack(epochs) if epochs else np.empty((0, len(actual_channel_names), int(round(args.imagery_seconds * actual_sample_rate)))),
-        labels=labels,
-        trials=trials,
-        sample_rate=actual_sample_rate,
-        channel_names=actual_channel_names,
-        subject_id=args.subject,
-        session_id=args.session,
-        segment_ids=recorder.snapshot_segment_ids(),
-        discarded_trials=discarded_trials,
-        recovery_stats=dict(getattr(source, "recovery_stats", {})),
-        recovery_events=list(getattr(source, "recovery_events", [])),
-        configuration={
-            **configuration,
-            "sample_rate": actual_sample_rate,
-        },
-    )
-    print(
-        f"已保存 {len(epochs)} 个 trial 到 {destination}；"
-        f"有效（未标记伪迹）{sum(not trial.artifact for trial in trials)} 个，"
-        f"伪迹标记 {sum(trial.artifact for trial in trials)} 个，断流或中断丢弃 {len(discarded_trials)} 个。"
-    )
-    if recording_error is not None:
-        print("采集发生异常；以上已完成 trial 已作为部分记录安全保存。")
-        raise recording_error.with_traceback(recording_traceback)
-    return 3 if discarded_trials else 0
+        result = finalize()
+    return result
 
 
 if __name__ == "__main__":

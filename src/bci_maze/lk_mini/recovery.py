@@ -14,7 +14,9 @@ from collections import deque
 
 import numpy as np
 
-from .source import BrainFlowSource, EEGChunk, EEGSource, EEGTransportError
+from bci_maze.stopping import defer_stop
+
+from .source import BrainFlowSource, EEGChunk, EEGSource, EEGTransportError, _SourceAlreadyStarted, _brainflow_config
 
 
 def is_transport_error(error: Exception) -> bool:
@@ -41,7 +43,7 @@ def _brainflow_worker(connection, session_parameters: dict) -> None:
     try:
         source = BrainFlowSource(**session_parameters)
         source.start()
-        connection.send(("ready", source.sample_rate, source.channel_names))
+        connection.send(("ready",))
         while True:
             if connection.poll() and connection.recv() == "stop":
                 break
@@ -74,6 +76,8 @@ class RecoveringBrainFlowSource(EEGSource):
     at that boundary, including when it is first reported in an empty chunk.
     """
 
+    validates_timing = True
+
     def __init__(
         self, *, session_parameters: dict | None = None,
         connect_timeout: float = 12.0, no_data_timeout: float = 3.0,
@@ -81,11 +85,8 @@ class RecoveringBrainFlowSource(EEGSource):
         max_retry_delay: float = 3.0, shutdown_timeout: float = 4.0,
         _context=None, _worker_target=None,
     ):
-        self.session_parameters = dict(session_parameters or {})
-        # Validate configuration before creating a worker or entering a retry loop.
-        configured = BrainFlowSource(**self.session_parameters)
-        for field in ("sample_rate", "channel_names", "channel_indices", "ip_address", "ip_port", "gain"):
-            setattr(self, field, getattr(configured, field))
+        self._session_parameters = _brainflow_config(**(session_parameters or {}))
+        self.__dict__.update(self._session_parameters)
         for name, value in (
             ("connect_timeout", connect_timeout), ("no_data_timeout", no_data_timeout),
             ("shutdown_timeout", shutdown_timeout),
@@ -152,7 +153,7 @@ class RecoveringBrainFlowSource(EEGSource):
     def start(self) -> None:
         with self._lock:
             if self._phase != "stopped":
-                raise RuntimeError("Source is already started; stop it before starting again")
+                raise _SourceAlreadyStarted("Source is already started; stop it before starting again")
             self._cancelled.clear()
             self._error = None
             self._episode_attempts = 0
@@ -162,12 +163,13 @@ class RecoveringBrainFlowSource(EEGSource):
             self._state = "connecting"
             self._spawn_worker()
 
+    @defer_stop()
     def _spawn_worker(self) -> None:
         if self._process is not None:
             raise RuntimeError("Previous EEG worker has not exited")
         parent, child = self._context.Pipe(duplex=True)
         process = self._context.Process(
-            target=self._worker_target, args=(child, self.session_parameters),
+            target=self._worker_target, args=(child, self._session_parameters),
             name="lk-mini-brainflow", daemon=True,
         )
         try:
@@ -177,8 +179,8 @@ class RecoveringBrainFlowSource(EEGSource):
             child.close()
             self._phase = self._state = "failed"
             raise
-        child.close()
         self._process, self._connection = process, parent
+        child.close()
         self._stats["attempts"] += 1
         self._episode_attempts += 1
         self._phase = "starting"
@@ -277,35 +279,25 @@ class RecoveringBrainFlowSource(EEGSource):
                     self._fail_session(message[2], retryable=message[1])
                     return self._empty()
                 if kind == "ready":
-                    if message[1] != self.sample_rate or tuple(message[2]) != self.channel_names:
-                        self._fail_session("EEG worker metadata differs from configured stream", retryable=False)
-                        return self._empty()
                     self._phase = "streaming"
                     self._session_ready = True
                     self._last_data_at = now
                     self._event("connected")
                 elif kind == "data":
-                    if self._phase != "streaming":
-                        self._fail_session("EEG data arrived before stream metadata", retryable=False)
-                        return self._empty()
                     if now - message[4] > self.no_data_timeout:
                         self._fail_session("EEG worker data exceeded the freshness deadline")
                         return self._empty()
                     chunk = EEGChunk(message[1], message[2], message[3], self.segment_id)
-                    if chunk.data.shape[0] != len(self.channel_names) or not np.isfinite(chunk.monotonic_timestamps).all():
-                        self._fail_session("EEG worker returned invalid data dimensions or timestamps", retryable=False)
-                        return self._empty()
-                    if chunk.data.shape[1]:
-                        self._last_data_at = now
-                        self._episode_attempts = 0
-                        self._has_data = True
-                        self._session_has_data = True
-                        self._state = "streaming"
-                        if self._pending_recovery:
-                            self._stats["reconnects"] += 1
-                            self._pending_recovery = False
-                            self._event("recovered")
-                        return chunk
+                    self._last_data_at = now
+                    self._episode_attempts = 0
+                    self._has_data = True
+                    self._session_has_data = True
+                    self._state = "streaming"
+                    if self._pending_recovery:
+                        self._stats["reconnects"] += 1
+                        self._pending_recovery = False
+                        self._event("recovered")
+                    return chunk
                 else:
                     self._fail_session(f"Unknown EEG worker message: {kind}", retryable=False)
                     return self._empty()
@@ -339,6 +331,7 @@ class RecoveringBrainFlowSource(EEGSource):
             if remaining <= 0 or self._cancelled.wait(min(0.005, remaining)):
                 return self._empty()
 
+    @defer_stop()
     def stop(self) -> None:
         self._cancelled.set()
         with self._lock:

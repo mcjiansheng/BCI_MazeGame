@@ -55,7 +55,8 @@ def test_car_removes_common_reference_and_normalization_is_train_only():
     assert mean.shape == std.shape == (1, 9, 16, 1)
 
 
-def test_safe_checkpoint_round_trip_and_input_contract(tmp_path):
+def test_safe_checkpoint_round_trip_and_input_contract(tmp_path, monkeypatch):
+    from bci_maze.lk_mini import semhaf
     bundle = new_bundle(device="cpu", metadata={"provenance": {"data_origin": "synthetic"}})
     bundle.mean, bundle.std = fit_normalization(filter_epochs(epochs()))
     values = epochs(1)
@@ -63,7 +64,12 @@ def test_safe_checkpoint_round_trip_and_input_contract(tmp_path):
     path = save_semhaf_bundle(bundle, tmp_path / "model.pt")
     payload = torch.load(path, weights_only=True)
     assert payload["preprocessing"]["reference"] == "CAR"
+    legacy_metadata = semhaf.preprocessing_metadata
+    monkeypatch.setattr(semhaf, "preprocessing_metadata", lambda: {**legacy_metadata(), "description": "Causal filter bank"})
+    # The runtime may describe its preprocessing in more detail without changing the checkpoint format.
     loaded = load_semhaf_bundle(path, device="cpu")
+    current = save_semhaf_bundle(loaded, tmp_path / "current.pt")
+    assert torch.load(current, weights_only=True)["preprocessing"]["description"] == "Causal filter bank"
     np.testing.assert_allclose(loaded.predict_proba(values[0], 250, DEFAULT_CHANNEL_NAMES), expected, atol=1e-6)
     assert loaded.classes == CLASSES
     assert loaded.provenance["data_origin"] == "synthetic"
@@ -76,6 +82,14 @@ def test_safe_checkpoint_round_trip_and_input_contract(tmp_path):
     ):
         with pytest.raises(ValueError):
             loaded.predict_proba(data, rate, names)
+    payload["preprocessing"]["note"] = "harmless provenance"
+    payload["config"]["note"] = "more metadata"
+    extended = tmp_path / "extended.pt"
+    torch.save(payload, extended)
+    np.testing.assert_allclose(
+        load_semhaf_bundle(extended, "cpu").predict_proba(values, 250, DEFAULT_CHANNEL_NAMES),
+        expected, atol=1e-6,
+    )
     payload["preprocessing"]["causal"] = False
     torch.save(payload, tmp_path / "wrong.pt")
     with pytest.raises(ValueError, match="preprocessing"):
@@ -150,7 +164,10 @@ def test_synthetic_finetune_provenance_and_independent_before_after(tmp_path):
     bundle = finetune_personal(pretrained, [path], "SYN",
         TrainingConfig(epochs=1, patience=1, batch_size=4, cpu_threads=2), device="cpu")
     assert bundle.subject_id == "SYN"
-    assert bundle.provenance == {"data_origin": "synthetic", "human_mi_verified": False, "calibration_passed": False}
+    assert bundle.provenance == {
+        "data_origin": "synthetic", "task": "motor_imagery",
+        "human_mi_verified": False, "calibration_passed": False,
+    }
     assert bundle.training_report["before_finetuning"]["n_trials"] == 8
     assert bundle.training_report["after_finetuning"]["n_trials"] == 8
     assert bundle.training_report["final_holdout_refit"] is False
@@ -168,7 +185,7 @@ def test_public_evaluation_reports_seen_and_validation_subjects_separately(tmp_p
         calls.append((subjects, session))
         return {"epochs": epochs(4), "labels": np.array([0, 1, 0, 1])}
     monkeypatch.setattr(training, "load_public_trials", fake_load)
-    monkeypatch.setattr(training, "evaluate_epochs", lambda *args: {"accuracy": .5, "balanced_accuracy": .5})
+    monkeypatch.setattr(training, "_evaluate_validated_epochs", lambda *args: {"accuracy": .5, "balanced_accuracy": .5})
     report = evaluate_public(bundle, tmp_path, [1, 2, 3])
     assert [record["category"] for record in report["subjects"]] == [
         "cross_session_seen_subject", "heldout_subject_used_for_T_validation", "unseen_subject"]
@@ -220,13 +237,16 @@ def test_personal_loader_drops_damaged_artifact_and_rejects_source_pollution(tmp
     # A fractional rate must not be silently truncated to the required 250 Hz.
     altered = {**original, "sample_rate": np.asarray(250.5)}
     np.savez(path, **altered)
-    with pytest.raises(ValueError, match="exactly 250"):
+    with pytest.raises(ValueError, match="positive integer sample rate"):
         load_personal_trials([path], "CHECK")
     for update, pattern in (({"kind": "replay"}, "provenance"),
-                            ({"kind": "hardware", "backend": "synthetic_mi"}, "conflicting"),
+                            ({"kind": "hardware", "backend": "synthetic_mi"}, "Conflicting"),
                             ({"kind": "hardware", "backend": "brainflow", "label_source": "scripted_simulation"}, "simulated labels")):
         metadata = json.loads(str(original["metadata_json"].item()))
         metadata["provenance"].update(update)
+        if pattern == "simulated labels":
+            metadata["provenance"]["source_kind"] = "hardware"
+            metadata["configuration"]["backend"] = "brainflow"
         np.savez(path, **{**original, "metadata_json": np.asarray(json.dumps(metadata))})
         with pytest.raises(ValueError, match=pattern):
             load_personal_trials([path], "CHECK")
@@ -235,3 +255,49 @@ def test_personal_loader_drops_damaged_artifact_and_rejects_source_pollution(tmp
     np.savez(path, **{**original, "metadata_json": np.asarray(json.dumps(metadata))})
     with pytest.raises(ValueError, match="microvolts"):
         load_personal_trials([path], "CHECK")
+
+
+def test_repeated_session_names_can_hold_out_one_file(tmp_path):
+    paths = [save_synthetic_mi_recording(
+        tmp_path / f"run{index}.npz",
+        schedule=[(block, label) for block in range(2) for _ in range(5) for label in CLASSES],
+        subject_id="S01", session_id="repeat",
+    ) for index in range(2)]
+    data = load_personal_trials(paths, "S01")
+    split_args = (data["labels"], data["groups"], data["sessions"])
+    with pytest.raises(ValueError, match="multiple files"):
+        personal_splits(*split_args, runs=data["runs"], holdout_session="repeat")
+    train, validation, test, _ = personal_splits(*split_args, runs=data["runs"], holdout_file=paths[1])
+    assert train.tolist() == list(range(10))
+    assert validation.tolist() == list(range(10, 20))
+    assert test.tolist() == list(range(20, 40))
+
+
+def test_personal_loader_requires_mi_and_records_constant_channel(tmp_path):
+    path = save_synthetic_mi_recording(
+        tmp_path / "recording.npz",
+        schedule=[(0, label) for _ in range(5) for label in CLASSES],
+        subject_id="S01", session_id="S01",
+    )
+    with np.load(path, allow_pickle=False) as saved:
+        payload = dict(saved)
+    payload["epochs"][0, 0] = 3
+    np.savez(path, **payload)
+    loaded = load_personal_trials([path], "S01")
+    assert np.all(loaded["epochs"][0, 0] == 3)
+    assert loaded["recordings"][0]["quality"]["trials_with_constant_channels"] == 1
+
+    metadata = json.loads(str(payload["metadata_json"].item()))
+    metadata["configuration"]["task"] = "motor_execution"
+    payload["metadata_json"] = np.asarray(json.dumps(metadata))
+    np.savez(path, **payload)
+    with pytest.raises(ValueError, match=r"recording\.npz.*motor_execution"):
+        load_personal_trials([path], "S01")
+
+    del metadata["configuration"]["task"]
+    metadata["provenance"] = {"kind": "hardware", "backend": "brainflow"}
+    metadata["configuration"] = {"backend": "brainflow"}
+    payload["metadata_json"] = np.asarray(json.dumps(metadata))
+    np.savez(path, **payload)
+    with pytest.raises(ValueError, match=r"recording\.npz.*task is unspecified"):
+        load_personal_trials([path], "S01")

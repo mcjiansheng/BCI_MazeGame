@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 import threading
 import time
 from dataclasses import asdict, dataclass
@@ -11,8 +13,10 @@ from typing import Sequence
 
 import numpy as np
 
-from .source import EEGSource
+from .source import EEGSource, _SourceAlreadyStarted
 from .timing import StreamTimingGuard
+from .provenance import BACKEND_SOURCES
+from bci_maze.stopping import defer_stop
 
 
 @dataclass
@@ -34,6 +38,7 @@ class ContinuousRecorder:
         self.source = source
         self._chunks: list[np.ndarray] = []
         self._timestamps: list[np.ndarray] = []
+        self._received_timestamps: list[np.ndarray] = []
         self._segment_ids: list[int] = []
         self._segment_id = 0
         self._samples = 0
@@ -72,14 +77,24 @@ class ContinuousRecorder:
     def start(self) -> None:
         if self._thread is not None:
             raise RuntimeError("Recorder already started")
-        self.source.start()
-        self._stop_event.clear()
-        self._thread = threading.Thread(target=self._run, name="EEG recorder", daemon=True)
-        self._thread.start()
+        try:
+            self.source.start()
+            with defer_stop():
+                self._stop_event.clear()
+                self._thread = threading.Thread(target=self._run, name="EEG recorder", daemon=True)
+                self._thread.start()
+        except _SourceAlreadyStarted:
+            raise
+        except BaseException:
+            try:
+                self.stop()
+            except BaseException:
+                pass  # Preserve the start failure, including cancellation.
+            raise
 
     def _run(self) -> None:
         try:
-            timing = StreamTimingGuard(self.source.sample_rate)
+            timing = None if getattr(self.source, "validates_timing", False) else StreamTimingGuard(self.source.sample_rate)
             last_sample_time = time.monotonic()
             while not self._stop_event.is_set():
                 chunk = self.source.read(timeout=0.25)
@@ -88,7 +103,8 @@ class ContinuousRecorder:
                     changed = chunk_segment != self._segment_id
                     self._segment_id = chunk_segment
                 if changed or self.recovering:
-                    timing = StreamTimingGuard(self.source.sample_rate)
+                    if timing is not None:
+                        timing = StreamTimingGuard(self.source.sample_rate)
                     last_sample_time = time.monotonic()
                 if not chunk.data.shape[1]:
                     if self.source.exhausted or (
@@ -96,11 +112,16 @@ class ContinuousRecorder:
                     ):
                         raise RuntimeError("EEG source ended or produced no samples for 5 seconds")
                     continue
-                timing.check(chunk.monotonic_timestamps)
+                if timing is not None:
+                    timing.check(chunk.monotonic_timestamps)
                 last_sample_time = time.monotonic()
                 with self._lock:
                     self._chunks.append(chunk.data.copy())
                     self._timestamps.append(chunk.monotonic_timestamps.copy())
+                    self._received_timestamps.append(
+                        chunk.received_timestamps.copy() if chunk.received_timestamps is not None
+                        else np.full(chunk.data.shape[1], np.nan)
+                    )
                     self._segment_ids.append(chunk_segment)
                     self._samples += chunk.data.shape[1]
                     self._last_received_at = last_sample_time
@@ -157,6 +178,11 @@ class ContinuousRecorder:
                 )
             return np.concatenate(self._chunks, axis=1), np.concatenate(self._timestamps)
 
+    def snapshot_received_timestamps(self) -> np.ndarray:
+        """Raw source timestamps; NaN marks sources without reception timestamps."""
+        with self._lock:
+            return np.concatenate(self._received_timestamps) if self._received_timestamps else np.empty(0)
+
     def recent(self, samples: int) -> np.ndarray:
         if samples <= 0:
             raise ValueError("samples must be positive")
@@ -203,9 +229,10 @@ class ContinuousRecorder:
                 raise RuntimeError("Recorder segment length mismatch")
             return result
 
+    @defer_stop()
     def stop(self) -> None:
         self._stop_event.set()
-        if self._thread is not None:
+        if self._thread is not None and self._thread.ident is not None:
             self._thread.join(timeout=2.0)
         self._thread = None
         self.source.stop()
@@ -218,6 +245,7 @@ class ContinuousRecorder:
         self.stop()
 
 
+@defer_stop()
 def save_mi_recording(
     path: str | Path,
     *,
@@ -235,14 +263,14 @@ def save_mi_recording(
     discarded_trials: Sequence[dict[str, object]] = (),
     recovery_stats: dict[str, object] | None = None,
     recovery_events: Sequence[dict[str, object]] = (),
+    received_timestamps: np.ndarray | None = None,
+    extra_arrays: dict[str, np.ndarray] | None = None,
+    trial_summary_override: dict[str, object] | None = None,
 ) -> Path:
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     backend = str(configuration.get("backend", "unspecified"))
-    source_kind = {
-        "brainflow": "hardware", "lsl": "lsl", "replay": "replay",
-        "synthetic": "synthetic", "synthetic_mi": "synthetic",
-    }.get(backend, "unspecified")
+    source_kind = BACKEND_SOURCES.get(backend, "unspecified")
     provenance = {
         "kind": source_kind,
         "source_kind": source_kind,
@@ -287,8 +315,8 @@ def save_mi_recording(
     segment_ids = np.zeros(np.asarray(timestamps).size, dtype=np.int64) if segment_ids is None else np.asarray(segment_ids, dtype=np.int64)
     if segment_ids.shape != np.asarray(timestamps).shape:
         raise ValueError("One segment ID is required per continuous EEG sample")
-    np.savez_compressed(
-        destination,
+    metadata["trial_summary"].update(trial_summary_override or {})
+    arrays = dict(
         continuous=np.asarray(continuous, dtype=np.float32),
         timestamps=np.asarray(timestamps, dtype=np.float64),
         segment_ids=segment_ids,
@@ -300,10 +328,30 @@ def save_mi_recording(
         channel_names=np.asarray(channel_names),
         metadata_json=np.asarray(json.dumps(metadata, ensure_ascii=False)),
     )
+    if received_timestamps is not None:
+        received = np.asarray(received_timestamps, dtype=np.float64)
+        if received.shape != np.asarray(timestamps).shape:
+            raise ValueError("One received timestamp is required per continuous EEG sample")
+        arrays["received_timestamps"] = received
+    if extra_arrays:
+        overlap = arrays.keys() & extra_arrays.keys()
+        if overlap:
+            raise ValueError(f"Extra arrays overwrite recording fields: {sorted(overlap)}")
+        arrays.update(extra_arrays)
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{destination.stem}-", suffix=".npz", dir=destination.parent)
+    os.close(descriptor)
+    try:
+        np.savez_compressed(temporary, **arrays)
+        os.replace(temporary, destination)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
     return destination
 
 
 def load_mi_recordings(paths: Sequence[str | Path]) -> dict[str, np.ndarray | list[dict]]:
+    paths = [Path(path).resolve() for path in paths]
+    if len(set(paths)) != len(paths):
+        raise ValueError("Provide unique recording paths; the same recording was selected more than once")
     all_epochs, all_labels, all_artifact, all_blocks = [], [], [], []
     expected_rate: int | None = None
     expected_channels: tuple[str, ...] | None = None
@@ -312,7 +360,10 @@ def load_mi_recordings(paths: Sequence[str | Path]) -> dict[str, np.ndarray | li
     for raw_path in paths:
         path = Path(raw_path)
         with np.load(path, allow_pickle=False) as loaded:
-            rate = int(np.asarray(loaded["sample_rate"]).item())
+            rate_value = np.asarray(loaded["sample_rate"]).item()
+            if not np.isfinite(rate_value) or rate_value <= 0 or rate_value != int(rate_value):
+                raise ValueError(f"Recording {path} requires a positive integer sample rate")
+            rate = int(rate_value)
             channels = tuple(str(value) for value in loaded["channel_names"].tolist())
             if expected_rate is None:
                 expected_rate, expected_channels = rate, channels

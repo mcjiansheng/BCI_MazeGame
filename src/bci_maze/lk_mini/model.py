@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Sequence
 
 import joblib
@@ -23,6 +24,8 @@ from sklearn.metrics import (
 )
 from sklearn.model_selection import StratifiedGroupKFold, StratifiedKFold
 from sklearn.pipeline import Pipeline
+
+from bci_maze.stopping import defer_stop
 
 
 @dataclass(frozen=True)
@@ -46,6 +49,9 @@ class EpochBandpass(BaseEstimator, TransformerMixin):
 
     def fit(self, x: np.ndarray, y: np.ndarray | None = None):
         _validate_epochs(x)
+        return self._fit_filter()
+
+    def _fit_filter(self):
         if not 0 < self.low_freq < self.high_freq < self.sample_rate / 2:
             raise ValueError("Invalid band-pass frequencies")
         self.sos_ = butter(
@@ -58,11 +64,14 @@ class EpochBandpass(BaseEstimator, TransformerMixin):
         return self
 
     def transform(self, x: np.ndarray) -> np.ndarray:
-        epochs = _validate_epochs(x)
         if not hasattr(self, "sos_"):
             raise RuntimeError("EpochBandpass is not fitted")
-        filtered = sosfiltfilt(self.sos_, epochs, axis=-1)
-        return np.nan_to_num(filtered, copy=False).astype(np.float64, copy=False)
+        return sosfiltfilt(self.sos_, _validate_epochs(x), axis=-1)
+
+    def fit_transform(self, x: np.ndarray, y: np.ndarray | None = None) -> np.ndarray:
+        epochs = _validate_epochs(x)
+        self._fit_filter()
+        return sosfiltfilt(self.sos_, epochs, axis=-1)
 
 
 class BinaryCSP(BaseEstimator, TransformerMixin):
@@ -79,7 +88,7 @@ class BinaryCSP(BaseEstimator, TransformerMixin):
         return covariance / max(trace, 1e-12)
 
     def fit(self, x: np.ndarray, y: np.ndarray):
-        epochs = _validate_epochs(x)
+        epochs = self._input_epochs(x)
         labels = np.asarray(y)
         classes = np.unique(labels)
         if classes.size != 2:
@@ -109,7 +118,7 @@ class BinaryCSP(BaseEstimator, TransformerMixin):
         return self
 
     def transform(self, x: np.ndarray) -> np.ndarray:
-        epochs = _validate_epochs(x)
+        epochs = self._input_epochs(x)
         if not hasattr(self, "filters_"):
             raise RuntimeError("BinaryCSP is not fitted")
         projected = np.einsum("kc,nct->nkt", self.filters_, epochs)
@@ -117,15 +126,36 @@ class BinaryCSP(BaseEstimator, TransformerMixin):
         normalized = variances / np.maximum(variances.sum(axis=1, keepdims=True), 1e-12)
         return np.log(np.maximum(normalized, 1e-12))
 
+    @staticmethod
+    def _input_epochs(x: np.ndarray) -> np.ndarray:
+        return _validate_epochs(x)
 
-def _validate_epochs(x: np.ndarray) -> np.ndarray:
+
+class _FilteredCSP(BinaryCSP):
+    """CSP stage used after the pipeline's band-pass input check."""
+
+    @staticmethod
+    def _input_epochs(x: np.ndarray) -> np.ndarray:
+        return x
+
+
+def _epoch_array(x: np.ndarray) -> np.ndarray:
     epochs = np.asarray(x, dtype=np.float64)
     if epochs.ndim != 3:
         raise ValueError("epochs must be trials x channels x samples")
     if epochs.shape[0] == 0 or epochs.shape[1] < 2 or epochs.shape[2] < 32:
         raise ValueError(f"Invalid epoch shape: {epochs.shape}")
+    return epochs
+
+
+def _check_finite(epochs: np.ndarray) -> None:
     if not np.isfinite(epochs).all():
         raise ValueError("EEG epochs contain NaN or infinity; exclude the damaged trials before training")
+
+
+def _validate_epochs(x: np.ndarray) -> np.ndarray:
+    epochs = _epoch_array(x)
+    _check_finite(epochs)
     return epochs
 
 
@@ -141,7 +171,7 @@ def build_csp_lda_pipeline(config: MIModelConfig) -> Pipeline:
                     config.filter_order,
                 ),
             ),
-            ("csp", BinaryCSP(config.csp_components, regularization=0.1)),
+            ("csp", _FilteredCSP(config.csp_components, regularization=0.1)),
             ("lda", LinearDiscriminantAnalysis(solver="lsqr", shrinkage="auto")),
         ]
     )
@@ -155,8 +185,22 @@ class MIModelBundle:
     classes: tuple[str, ...]
     subject_id: str
     training_files: tuple[str, ...]
+    metadata: dict[str, object] = field(default_factory=dict)
+
+    def __setstate__(self, state: dict) -> None:
+        state.setdefault("metadata", {})
+        self.__dict__.update(state)
+
+    @property
+    def provenance(self) -> dict[str, object]:
+        return self.metadata.get("provenance", {})
 
     def validate_input(self, epoch: np.ndarray, sample_rate: int, channel_names: Sequence[str]) -> np.ndarray:
+        values = self._input_epochs(epoch, sample_rate, channel_names)
+        _check_finite(values)
+        return values
+
+    def _input_epochs(self, epoch: np.ndarray, sample_rate: int, channel_names: Sequence[str]) -> np.ndarray:
         values = np.asarray(epoch, dtype=np.float64)
         if values.ndim == 2:
             values = values[None, :, :]
@@ -171,10 +215,17 @@ class MIModelBundle:
             raise ValueError(
                 f"Model requires (*, {len(self.channel_names)}, {expected_samples}), got {values.shape}"
             )
-        return _validate_epochs(values)
+        return _epoch_array(values)
 
     def predict_proba(self, epoch: np.ndarray, sample_rate: int, channel_names: Sequence[str]) -> np.ndarray:
-        values = self.validate_input(epoch, sample_rate, channel_names)
+        values = self._input_epochs(epoch, sample_rate, channel_names)
+        # The built-in pipeline checks raw epochs in its first transform.
+        if not (
+            type(self.pipeline) is Pipeline
+            and len(self.pipeline.steps) > 1
+            and type(self.pipeline.steps[0][1]) is EpochBandpass
+        ):
+            _check_finite(values)
         return self.pipeline.predict_proba(values)
 
 
@@ -227,7 +278,7 @@ def train_subject_model(
     config: MIModelConfig,
     seed: int = 42,
 ) -> tuple[MIModelBundle, dict[str, object]]:
-    values = _validate_epochs(epochs)
+    values = _epoch_array(epochs)
     targets = np.asarray(labels).astype(str)
     group_values = np.asarray(groups, dtype=np.int64)
     if len(targets) != len(values) or len(group_values) != len(values):
@@ -249,16 +300,12 @@ def train_subject_model(
 
     splits, validation_kind = _cross_validation_splits(targets, group_values, seed)
     predictions = np.empty(targets.shape, dtype=targets.dtype)
-    probabilities = np.zeros((len(targets), len(classes)), dtype=np.float64)
     folds = []
     for fold_index, (train_indices, test_indices) in enumerate(splits, start=1):
         pipeline = build_csp_lda_pipeline(config)
         pipeline.fit(values[train_indices], targets[train_indices])
         fold_predictions = pipeline.predict(values[test_indices])
-        fold_probabilities = pipeline.predict_proba(values[test_indices])
         predictions[test_indices] = fold_predictions
-        for source_column, class_name in enumerate(pipeline.classes_):
-            probabilities[test_indices, classes.index(str(class_name))] = fold_probabilities[:, source_column]
         folds.append(
             {
                 "fold": fold_index,
@@ -354,13 +401,17 @@ def train_subject_model(
     return bundle, report
 
 
+@defer_stop()
 def save_model_bundle(bundle: MIModelBundle, report: dict[str, object], path: str | Path) -> Path:
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    joblib.dump(bundle, destination)
-    destination.with_suffix(".json").write_text(
-        json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    with TemporaryDirectory(prefix=f".{destination.name}.", dir=destination.parent) as staging:
+        staged_bundle = Path(staging) / "bundle.joblib"
+        staged_report = Path(staging) / "report.json"
+        joblib.dump(bundle, staged_bundle)
+        staged_report.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        staged_bundle.replace(destination)
+        staged_report.replace(destination.with_suffix(".json"))
     return destination
 
 

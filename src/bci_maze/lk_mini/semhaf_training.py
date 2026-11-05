@@ -16,10 +16,11 @@ from sklearn.metrics import accuracy_score, balanced_accuracy_score, confusion_m
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, TensorDataset
 
+from .provenance import MODEL_DATA_ORIGINS, recording_source, require_motor_imagery
 from .recording import load_mi_recordings
 from .semhaf import (
     CLASSES, MONTAGE_ORDER_SOURCE, MONTAGE_SOURCE, SEMHAFBundle,
-    filter_epochs, fit_normalization, load_semhaf_bundle, new_bundle,
+    _filter_validated_epochs, fit_normalization, load_semhaf_bundle, new_bundle,
     public_channel_indices, validate_epochs,
 )
 from .source import DEFAULT_CHANNEL_NAMES
@@ -81,11 +82,17 @@ def _predict_filtered(bundle: SEMHAFBundle, x: np.ndarray, batch_size: int) -> n
 
 
 def evaluate_epochs(bundle: SEMHAFBundle, epochs: np.ndarray, labels: np.ndarray, batch_size: int = 32) -> dict:
+    values = validate_epochs(epochs, 250, DEFAULT_CHANNEL_NAMES)
+    return _evaluate_validated_epochs(bundle, values, labels, batch_size)
+
+
+def _evaluate_validated_epochs(bundle: SEMHAFBundle, epochs: np.ndarray, labels: np.ndarray, batch_size: int) -> dict:
     _require_classes(labels, 1, "evaluation")
     # Filter in batches to bound memory when evaluating a complete public session.
     probabilities = []
     for start in range(0, len(epochs), batch_size):
-        probabilities.append(bundle.predict_proba(epochs[start:start + batch_size], 250, DEFAULT_CHANNEL_NAMES))
+        filtered = _filter_validated_epochs(epochs[start:start + batch_size])
+        probabilities.append(_predict_filtered(bundle, filtered, batch_size))
     return classification_metrics(labels, np.concatenate(probabilities))
 
 
@@ -104,10 +111,22 @@ def fit_model(
     *, validation_groups: np.ndarray | None = None,
 ) -> dict:
     """Only train epochs fit normalization/gradients; validation selects the epoch."""
+    return _fit_validated_model(
+        bundle, validate_epochs(train_epochs, 250, DEFAULT_CHANNEL_NAMES), train_labels,
+        validate_epochs(validation_epochs, 250, DEFAULT_CHANNEL_NAMES), validation_labels,
+        config, validation_groups=validation_groups,
+    )
+
+
+def _fit_validated_model(
+    bundle: SEMHAFBundle, train_epochs: np.ndarray, train_labels: np.ndarray,
+    validation_epochs: np.ndarray, validation_labels: np.ndarray, config: TrainingConfig,
+    *, validation_groups: np.ndarray | None = None,
+) -> dict:
     seed_training(config)
     _require_classes(train_labels, 3, "training")
     _require_classes(validation_labels, 2, "validation")
-    train_x, validation_x = filter_epochs(train_epochs), filter_epochs(validation_epochs)
+    train_x, validation_x = _filter_validated_epochs(train_epochs), _filter_validated_epochs(validation_epochs)
     bundle.mean, bundle.std = fit_normalization(train_x)
     train_x -= bundle.mean
     train_x /= bundle.std
@@ -208,7 +227,7 @@ def pretrain_public(
         "initialization_reason": "Fresh 16-channel binary CAR training on T sessions; archived subject-specific checkpoints have incompatible montages and prior validation histories.",
         "public_epoch": "trial_onset_plus_2_to_6_seconds", "raw_units": "uV",
     })
-    report = fit_model(bundle, train["epochs"], train["labels"], validation["epochs"], validation["labels"], config, validation_groups=validation["groups"])
+    report = _fit_validated_model(bundle, train["epochs"], train["labels"], validation["epochs"], validation["labels"], config, validation_groups=validation["groups"])
     report.update({"stage": "public_pretraining", "data_origin": "public", "train_sessions": train["sessions"],
                    "validation_sessions": validation["sessions"], "split": "disjoint_subject_T_validation",
                    "E_sessions_used_during_training": False, "final_E_evaluation": "pending_separate_evaluate_only_command"})
@@ -225,7 +244,7 @@ def evaluate_public(bundle: SEMHAFBundle, processed_dir: str | Path, subjects: S
         category = "cross_session_seen_subject" if subject in seen else (
             "heldout_subject_used_for_T_validation" if subject in validation_subjects else "unseen_subject")
         records.append({"subject": subject, "session": "E", "category": category,
-                        **evaluate_epochs(bundle, data["epochs"], data["labels"], batch_size)})
+                        **_evaluate_validated_epochs(bundle, data["epochs"], data["labels"], batch_size)})
     categories = sorted({record["category"] for record in records})
     return {"stage": "public_final_E_evaluation", "data_origin": "public", "model_selection": False, "subjects": records,
             "category_means": {category: {
@@ -239,66 +258,82 @@ def load_personal_trials(paths: Sequence[str | Path], subject_id: str) -> dict:
     canonical = [str(Path(path).resolve()) for path in paths]
     if not canonical or len(set(canonical)) != len(canonical):
         raise ValueError("Provide unique recording paths")
-    epochs, labels, groups, sessions, metadata, origins = [], [], [], [], [], set()
-    session_ids = set()
+    epochs, labels, groups, sessions, runs, metadata = [], [], [], [], [], []
+    origins = set()
     for file_index, path in enumerate(canonical):
-        with np.load(path, allow_pickle=False) as header:
-            if float(np.asarray(header["sample_rate"]).item()) != 250.0:
-                raise ValueError(f"Recording {path} must use exactly 250 Hz")
         data = load_mi_recordings([path])
         meta = data["metadata"][0]
-        if str(meta.get("subject_id")) != subject_id:
+        if not meta.get("subject_id") or str(meta["subject_id"]) != subject_id:
             raise ValueError(f"Recording {path} does not belong to subject {subject_id}")
-        session = str(meta.get("session_id", ""))
-        if not session or session in session_ids:
-            raise ValueError("Recordings require unique non-empty session IDs")
-        session_ids.add(session)
+        session = str(meta.get("session_id") or "").strip()
+        if not session:
+            raise ValueError(f"Recording {path} needs a session ID")
         if meta.get("units", "uV") != "uV":
             raise ValueError(f"Recording {path} must contain microvolts (uV)")
-        provenance = meta.get("provenance", {})
-        kind = provenance.get("kind")
-        if not kind:
-            kind = {"brainflow": "hardware", "lsl": "lsl", "synthetic": "synthetic", "synthetic_mi": "synthetic"}.get(meta.get("configuration", {}).get("backend"))
-        origin = {"hardware": "hardware_recorded", "lsl": "lsl_recorded", "synthetic": "synthetic"}.get(kind)
+        try:
+            kind = recording_source(meta)
+            require_motor_imagery(meta)
+        except ValueError as error:
+            raise ValueError(f"Recording {path}: {error}") from error
+        origin = MODEL_DATA_ORIGINS.get(kind)
         if origin is None:
             raise ValueError(f"Recording {path} has unsupported or unverified source provenance: {kind!r}")
-        backend = provenance.get("backend") or meta.get("configuration", {}).get("backend")
-        if kind in {"hardware", "lsl"} and backend in {"synthetic", "synthetic_mi", "replay"}:
-            raise ValueError(f"Recording {path} has conflicting source provenance")
-        if kind in {"hardware", "lsl"} and provenance.get("label_source") == "scripted_simulation":
-            raise ValueError(f"Recording {path} has simulated labels marked as hardware acquisition")
         origins.add(origin)
-        targets = np.asarray(data["labels"]).astype(str)
+        targets = data["labels"]
         if not np.isin(targets, CLASSES).all():
-            raise ValueError("Personal recordings must contain only left_hand and right_hand labels")
-        keep = ~np.asarray(data["artifact"], dtype=bool)
-        values = validate_epochs(data["epochs"][keep], int(data["sample_rate"]), data["channel_names"].tolist())
+            raise ValueError(f"Recording {path} must contain only left_hand and right_hand labels")
+        keep = ~data["artifact"]
+        try:
+            values = validate_epochs(data["epochs"][keep], int(data["sample_rate"]), data["channel_names"].tolist())
+        except ValueError as error:
+            raise ValueError(f"Recording {path}: {error}") from error
         epochs.append(values)
         labels.append(np.asarray([CLASSES.index(label) for label in targets[keep]], dtype=np.int64))
         groups.extend([f"{file_index}:{int(block)}" for block in data["blocks"][keep]])
         sessions.extend([session] * int(keep.sum()))
-        metadata.append({"file": path, "metadata": meta, "clean_trials": int(keep.sum()), "artifact_trials": int((~keep).sum())})
+        runs.extend([path] * int(keep.sum()))
+        constant = np.all(values == values[..., :1], axis=-1)
+        metadata.append({
+            "file": path, "metadata": meta, "clean_trials": int(keep.sum()),
+            "artifact_trials": int((~keep).sum()),
+            "quality": {"trials_with_constant_channels": int(constant.any(axis=1).sum()),
+                        "constant_trials_by_channel": dict(zip(DEFAULT_CHANNEL_NAMES, constant.sum(axis=0).tolist()))},
+        })
     if len(origins) != 1:
         raise ValueError("Personal training requires a single data origin; keep synthetic and hardware sources separate")
     return {"epochs": np.concatenate(epochs), "labels": np.concatenate(labels), "groups": np.asarray(groups),
-            "sessions": np.asarray(sessions), "recordings": metadata, "files": canonical, "data_origin": origins.pop()}
+            "sessions": np.asarray(sessions), "runs": np.asarray(runs), "recordings": metadata, "files": canonical, "data_origin": origins.pop()}
 
 
-def personal_splits(labels: np.ndarray, groups: np.ndarray, sessions: np.ndarray, *, seed: int = 42, holdout_session: str | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
+def personal_splits(
+    labels: np.ndarray, groups: np.ndarray, sessions: np.ndarray, *, seed: int = 42,
+    holdout_session: str | None = None, holdout_file: str | Path | None = None,
+    runs: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
     """Later group/session is final evaluation; an earlier split selects epochs."""
     ordered_groups = list(dict.fromkeys(groups.tolist()))
-    if holdout_session is not None:
-        if holdout_session not in sessions:
+    if holdout_file is not None and holdout_session is not None:
+        raise ValueError("Choose either a holdout session or a holdout file")
+    if holdout_file is not None:
+        path = str(Path(holdout_file).resolve())
+        if runs is None or path not in runs:
+            raise ValueError(f"Unknown holdout file {path!r}")
+        held_out = runs == path
+        test_description = f"independent_file:{path}"
+    elif holdout_session is not None:
+        held_out = sessions == holdout_session
+        if not held_out.any():
             raise ValueError(f"Unknown holdout session {holdout_session!r}")
-        test = np.flatnonzero(sessions == holdout_session)
-        development = np.flatnonzero(sessions != holdout_session)
+        if runs is not None and np.unique(runs[held_out]).size > 1:
+            raise ValueError(f"Holdout session {holdout_session!r} matches multiple files; choose one with --holdout-file")
         test_description = f"independent_session:{holdout_session}"
     else:
         if len(ordered_groups) < 2:
             raise ValueError("Personal calibration needs at least two blocks or an independent holdout session")
-        test = np.flatnonzero(groups == ordered_groups[-1])
-        development = np.flatnonzero(groups != ordered_groups[-1])
+        held_out = groups == ordered_groups[-1]
         test_description = f"last_block_in_input_order:{ordered_groups[-1]}"
+    test = np.flatnonzero(held_out)
+    development = np.flatnonzero(~held_out)
     development_groups = list(dict.fromkeys(groups[development].tolist()))
     if len(development_groups) >= 2:
         validation = development[groups[development] == development_groups[-1]]
@@ -324,7 +359,7 @@ def personal_splits(labels: np.ndarray, groups: np.ndarray, sessions: np.ndarray
 
 def finetune_personal(
     pretrained: str | Path, paths: Sequence[str | Path], subject_id: str, config: TrainingConfig,
-    *, device: str = "auto", holdout_session: str | None = None,
+    *, device: str = "auto", holdout_session: str | None = None, holdout_file: str | Path | None = None,
 ) -> SEMHAFBundle:
     seed_training(config)
     bundle = load_semhaf_bundle(pretrained, device=device)
@@ -333,15 +368,18 @@ def finetune_personal(
         raise ValueError(f"Checkpoint belongs to another participant: {bundle.subject_id}")
     if bundle.provenance.get("data_origin") != "public":
         raise ValueError("Start this evaluation from the public pretrained checkpoint to keep personal holdout history independent")
-    train, validation, test, split = personal_splits(data["labels"], data["groups"], data["sessions"], seed=config.seed, holdout_session=holdout_session)
-    before = evaluate_epochs(bundle, data["epochs"][test], data["labels"][test], config.batch_size)
-    report = fit_model(bundle, data["epochs"][train], data["labels"][train], data["epochs"][validation], data["labels"][validation], config)
-    after = evaluate_epochs(bundle, data["epochs"][test], data["labels"][test], config.batch_size)
+    train, validation, test, split = personal_splits(
+        data["labels"], data["groups"], data["sessions"], seed=config.seed,
+        holdout_session=holdout_session, holdout_file=holdout_file, runs=data["runs"],
+    )
+    before = _evaluate_validated_epochs(bundle, data["epochs"][test], data["labels"][test], config.batch_size)
+    report = _fit_validated_model(bundle, data["epochs"][train], data["labels"][train], data["epochs"][validation], data["labels"][validation], config)
+    after = _evaluate_validated_epochs(bundle, data["epochs"][test], data["labels"][test], config.batch_size)
     human_verified = data["data_origin"] != "synthetic" and all(record["metadata"].get("provenance", {}).get("human_mi_verified") is True for record in data["recordings"])
     parent_metadata = copy.deepcopy(bundle.metadata)
     bundle.subject_id = subject_id
     bundle.metadata = {
-        "provenance": {"data_origin": data["data_origin"], "human_mi_verified": human_verified,
+        "provenance": {"data_origin": data["data_origin"], "task": "motor_imagery", "human_mi_verified": human_verified,
                        "calibration_passed": bool(data["data_origin"] != "synthetic" and after["above_chance_95_percent"])},
         "training_files": data["files"], "pretrained_checkpoint": str(Path(pretrained).resolve()),
         "public_pretraining": parent_metadata, "recordings": data["recordings"],

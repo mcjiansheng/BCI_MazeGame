@@ -12,22 +12,24 @@ from bci_maze.lk_mini.model import MIModelConfig, build_csp_lda_pipeline
 CLASSES = ("left_hand", "right_hand")
 
 
-def group_splits(labels: np.ndarray, sessions: np.ndarray, blocks: np.ndarray, split: str = "auto"):
-    """Keep each session/block together, with no random-trial fallback."""
+def group_splits(labels: np.ndarray, runs: np.ndarray, blocks: np.ndarray, split: str = "auto"):
+    """Hold out one acquisition file or one block within a file."""
     if split not in {"auto", "session", "block"}:
-        raise ValueError("split 必须为 auto、session 或 block。")
-    labels, sessions, blocks = np.asarray(labels), np.asarray(sessions).astype(str), np.asarray(blocks).astype(str)
-    if labels.ndim != 1 or sessions.shape != labels.shape or blocks.shape != labels.shape:
-        raise ValueError("每个试次须有一个类别、会话和分组标签。")
+        raise ValueError("split 须为 auto、session（按采集文件）或 block（按文件内实验组）。")
+    labels, runs, blocks = np.asarray(labels), np.asarray(runs).astype(str), np.asarray(blocks).astype(str)
+    if labels.ndim != 1 or runs.shape != labels.shape or blocks.shape != labels.shape:
+        raise ValueError("每个试次须有一个类别、采集文件和实验组标签。")
     if set(labels.tolist()) != set(CLASSES):
         raise ValueError("分组评估需要左手和右手两类有效试次。")
-    method = "session" if split == "session" or (split == "auto" and np.unique(sessions).size >= 2) else "block"
-    # Structured pairs avoid collisions in user-supplied session names.
-    groups = sessions if method == "session" else np.asarray([
-        f"{len(session)}:{session}/block:{block}" for session, block in zip(sessions, blocks)
+    hold_out_runs = split == "session" or (split == "auto" and np.unique(runs).size >= 2)
+    # Prefix the run with its length to keep run/block pairs distinct.
+    groups = runs if hold_out_runs else np.asarray([
+        f"{len(run)}:{run}/block:{block}" for run, block in zip(runs, blocks)
     ])
-    if np.unique(groups).size < 2:
-        raise ValueError(f"按{('会话' if method == 'session' else '实验组')}划分需要至少两个独立组，当前为 {np.unique(groups).size} 组。")
+    n_groups = np.unique(groups).size
+    if n_groups < 2:
+        basis = "采集文件" if hold_out_runs else "文件内实验组"
+        raise ValueError(f"按{basis}划分需要至少两个独立组，当前为 {n_groups} 组。")
     folds = list(LeaveOneGroupOut().split(np.zeros(len(labels)), labels, groups))
     for index, (train, test) in enumerate(folds, 1):
         if set(labels[train]) != set(CLASSES) or set(labels[test]) != set(CLASSES):
@@ -35,18 +37,17 @@ def group_splits(labels: np.ndarray, sessions: np.ndarray, blocks: np.ndarray, s
             raise ValueError(f"第 {index} 折须在训练集和测试集各包含两类；当前训练左/右为 {counts(train)}，测试左/右为 {counts(test)}。")
         if any(np.count_nonzero(labels[train] == label) < 2 for label in CLASSES):
             raise ValueError(f"第 {index} 折训练集每类需要至少两个有效试次。")
-        if set(groups[train]) & set(groups[test]):
-            raise RuntimeError("训练组与测试组重叠。")
-    return groups, folds, "leave_one_session_out" if method == "session" else "leave_one_block_out"
+    return groups, folds, "leave_one_run_out" if hold_out_runs else "leave_one_block_out"
 
 
-def grouped_benchmark(epochs: np.ndarray, labels: np.ndarray, sessions: np.ndarray,
+def grouped_benchmark(epochs: np.ndarray, labels: np.ndarray, runs: np.ndarray,
                       blocks: np.ndarray, sample_rate: int, *, permutations: int = 30,
                       seed: int = 42, split: str = "auto") -> dict:
-    if type(permutations) is not int or not 0 <= permutations <= 1000:
+    if isinstance(permutations, (bool, np.bool_)) or not isinstance(permutations, (int, np.integer)) or not 0 <= permutations <= 1000:
         raise ValueError("置乱次数须为 0–1000 的整数。")
+    permutations = int(permutations)
     epochs, labels = np.asarray(epochs, dtype=np.float64), np.asarray(labels).astype(str)
-    groups, folds, method = group_splits(labels, sessions, blocks, split)
+    groups, folds, method = group_splits(labels, runs, blocks, split)
     if epochs.ndim != 3 or len(epochs) != len(labels) or epochs.shape[1] < 2 or not np.isfinite(epochs).all():
         raise ValueError("CSP 输入须为有限值的试次 × EEG 通道 × 采样点数组，至少两个通道。")
     config = MIModelConfig(sample_rate=sample_rate, low_freq=7.0, high_freq=30.0,
@@ -86,7 +87,8 @@ def grouped_benchmark(epochs: np.ndarray, labels: np.ndarray, sessions: np.ndarr
         permuted_predictions, _ = cross_validate(shuffled)
         null_scores.append(float(balanced_accuracy_score(shuffled, permuted_predictions)))
     return dict(
-        status="completed", split_method=method, n_groups=int(np.unique(groups).size), n_splits=len(folds),
+        status="completed", split_method=method, n_runs=int(np.unique(runs).size),
+        n_groups=int(np.unique(groups).size), n_splits=len(folds),
         accuracy=float(accuracy_score(labels, prediction)), balanced_accuracy=observed,
         chance_balanced_accuracy=0.5, class_order=list(CLASSES),
         confusion_matrix=confusion_matrix(labels, prediction, labels=CLASSES).tolist(),

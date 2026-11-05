@@ -111,6 +111,7 @@ def save_synthetic_mi_recording(
         configuration={
             **(configuration or {}),
             "backend": "synthetic_mi",
+            "task": "motor_imagery",
             "label_source": "scripted_simulation",
             "reference": "synthetic",
             "reference_location": "not_applicable",

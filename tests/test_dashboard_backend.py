@@ -308,11 +308,13 @@ def test_worker_cooperative_stop_preserves_save_and_runs_cleanup(tmp_path, mode)
 import numpy as np
 import time
 from pathlib import Path
-def save_mi_recording():
+from bci_maze.stopping import defer_stop
+@defer_stop()
+def persist_arbitrary_name():
     Path(READY).touch()
     time.sleep(1)
     np.savez_compressed(RESULT, values=np.arange(1000))
-save_mi_recording()
+persist_arbitrary_name()
 """
     elif mode == "temporary_close":
         code = """
@@ -352,7 +354,7 @@ finally:
         stop.touch()
         output, _ = process.communicate(timeout=10)
         if mode == "save":
-            assert process.returncode == 0, output
+            assert process.returncode == 130, output
             with np.load(result, allow_pickle=False) as saved:
                 np.testing.assert_array_equal(saved["values"], np.arange(1000))
         else:

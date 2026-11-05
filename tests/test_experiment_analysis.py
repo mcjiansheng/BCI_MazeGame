@@ -94,9 +94,9 @@ def test_stationary_noise_ersp_is_centered_at_zero_db(tmp_path):
         assert np.max(np.abs(np.mean(panel["db"], axis=1))) < 1.0
 
 
-def test_grouped_benchmark_holds_out_whole_sessions_and_refits_per_permutation(monkeypatch):
+def test_grouped_benchmark_holds_out_whole_runs_and_refits_per_permutation(monkeypatch):
     labels = np.tile(["left_hand", "right_hand"], 12)
-    sessions = np.repeat(["one", "two", "three"], 8)
+    runs = np.repeat(["one", "two", "three"], 8)
     blocks = np.tile(np.repeat([0, 1], 4), 3)
     epochs = np.random.default_rng(4).normal(size=(24, 3, 100))
     epochs[:, 0, 0] = np.arange(24)
@@ -113,14 +113,14 @@ def test_grouped_benchmark_holds_out_whole_sessions_and_refits_per_permutation(m
             return np.repeat("left_hand", len(x))
 
     monkeypatch.setattr(benchmark, "build_csp_lda_pipeline", lambda config: ProbePipeline())
-    result = benchmark.grouped_benchmark(epochs, labels, sessions, blocks, 100, permutations=5, seed=12)
-    assert result["split_method"] == "leave_one_session_out"
-    assert result["n_groups"] == result["n_splits"] == 3
+    result = benchmark.grouped_benchmark(epochs, labels, runs, blocks, 100, permutations=np.int64(5), seed=12)
+    assert result["split_method"] == "leave_one_run_out"
+    assert result["n_runs"] == result["n_groups"] == result["n_splits"] == 3
     assert len(fits) == 3 * (5 + 1)
     assert any(not np.array_equal(target, labels[members]) for members, target in fits[3:])
     for members, target in fits:
-        for session in np.unique(sessions[members]):
-            select = sessions[members] == session
+        for run in np.unique(runs[members]):
+            select = runs[members] == run
             assert sorted(target[select]) == sorted(labels[members][select])
     test_indices = []
     for fold in result["folds"]:
@@ -128,13 +128,17 @@ def test_grouped_benchmark_holds_out_whole_sessions_and_refits_per_permutation(m
         test_indices.extend(fold["test_indices"])
     assert sorted(test_indices) == list(range(len(labels)))
     assert result["permutation"]["p_value"] == 1
+    for boolean in (True, np.bool_(True)):
+        with pytest.raises(ValueError, match="整数"):
+            benchmark.grouped_benchmark(epochs, labels, runs, blocks, 100, permutations=boolean)
 
 
 def test_real_csp_baseline_decodes_injected_spatial_pattern(tmp_path):
     recording = load_recordings([write_recording(tmp_path / "pattern.npz")])
-    result = benchmark.grouped_benchmark(recording.epochs, recording.labels, recording.sessions,
+    result = benchmark.grouped_benchmark(recording.epochs, recording.labels, recording.runs,
         recording.blocks, recording.sample_rate, permutations=3, seed=8)
     assert result["split_method"] == "leave_one_block_out"
+    assert result["n_runs"] == 1
     assert result["balanced_accuracy"] >= 0.9
     null = result["permutation"]["null_scores"]
     assert len(null) == 3 and all(0 <= score <= 1 for score in null)
@@ -157,14 +161,15 @@ def test_incompatible_identity_task_and_source_are_rejected(tmp_path, changed):
         load_recordings([first, second])
 
 
-def test_same_session_and_block_stay_grouped_across_files(tmp_path):
+def test_same_session_and_block_names_do_not_merge_distinct_recordings(tmp_path):
     paths = [write_recording(tmp_path / f"part{i}.npz", seed=i) for i in range(2)]
     recording = load_recordings(paths)
-    groups, folds, _ = benchmark.group_splits(recording.labels, recording.sessions, recording.blocks)
-    assert len(np.unique(groups)) == 3
-    assert len(folds) == 3
-    assert recording.trial_origins[0]["file"] != recording.trial_origins[24]["file"]
-    assert groups[0] == groups[24]
+    for split, expected in (("auto", 2), ("session", 2), ("block", 6)):
+        groups, folds, _ = benchmark.group_splits(recording.labels, recording.runs, recording.blocks, split)
+        assert len(np.unique(groups)) == len(folds) == expected
+        assert groups[0] != groups[24]
+        assert all(len({recording.trial_origins[index]["file"] for index in test}) == 1 for _, test in folds)
+    assert recording.trial_origins[0]["session"] == recording.trial_origins[24]["session"]
 
 
 @pytest.mark.parametrize("nonfinite", ["active", "baseline"])
@@ -201,7 +206,10 @@ def test_baseline_analysis_generates_full_figures_and_keeps_group_failure_report
     assert report["source_kind"] == "synthetic"
     assert report["baseline_available"] is True
     assert report["benchmark"]["status"] == "unavailable"
+    assert "采集文件" in report["benchmark"]["reason"]
     assert "至少两个" in report["benchmark"]["reason"]
+    assert report["benchmark"]["n_runs"] == 1
+    assert report["benchmark"]["n_run_blocks"] == 3
     assert {"ersp", "erd_comparison", "power_spectra", "topomap_power", "topomap_erd", "signed_r2"} <= {item["id"] for item in report["figures"]}
     assert report["analysis"]["ersp"]["units"] == "dB"
     assert report["methods"]["ersp"]["baseline_statistic"] == "mean_log_power_equivalent_to_geometric_mean_power"
@@ -247,6 +255,7 @@ def test_all_excluded_trials_write_context_report_without_statistics_or_figures(
     assert report["analysis"]["ersp"]["available"] is False
     assert report["analysis"]["signed_r2"]["available"] is False
     assert report["benchmark"]["status"] == "unavailable"
+    assert report["benchmark"]["n_runs"] == report["benchmark"]["n_run_blocks"] == 0
     assert "补采" in report["message"] and report["message"] in report["notes"]
     assert json.loads((directory / "report.json").read_text(encoding="utf-8")) == report
     assert not (directory / "report.json.tmp").exists()

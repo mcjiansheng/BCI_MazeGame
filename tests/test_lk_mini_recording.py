@@ -154,3 +154,88 @@ def test_recording_persists_discarded_trials_and_recovery_metadata(tmp_path):
         assert metadata["discarded_trials"][0]["reason"] == "stream_interrupted"
         assert metadata["recovery_stats"]["reconnects"] == 1
     assert load_mi_recordings([path])["epochs"].shape == (1, 2, 10)
+
+
+def test_recorder_preserves_raw_received_timestamps(tmp_path):
+    class ReceivedSource(FiniteSource):
+        def read(self, timeout=0.25):
+            chunk = super().read(timeout)
+            return EEGChunk(chunk.data, chunk.monotonic_timestamps,
+                            received_timestamps=chunk.monotonic_timestamps + 1700000000)
+    with ContinuousRecorder(ReceivedSource()) as recorder:
+        assert recorder.wait_for_samples(12, timeout=1)
+    data, timestamps = recorder.snapshot()
+    received = recorder.snapshot_received_timestamps()
+    np.testing.assert_array_equal(received, timestamps + 1700000000)
+    path = save_mi_recording(tmp_path / "raw.npz", continuous=data, timestamps=timestamps,
+                            received_timestamps=received, epochs=data[None], labels=["left_hand"],
+                            trials=[TrialRecord(0, 0, "left_hand", 0, 12, 0)], sample_rate=10,
+                            channel_names=("C3", "C4"), subject_id="S01", session_id="raw",
+                            configuration={"backend": "brainflow"})
+    with np.load(path, allow_pickle=False) as saved:
+        np.testing.assert_array_equal(saved["received_timestamps"], received)
+
+
+def test_recorder_releases_source_when_start_is_interrupted():
+    class InterruptedSource(FiniteSource):
+        def start(self):
+            self.running = True
+            raise KeyboardInterrupt
+    source = InterruptedSource()
+    with pytest.raises(KeyboardInterrupt):
+        ContinuousRecorder(source).start()
+    assert not source.running
+
+
+def test_recorder_releases_started_thread_on_stop_signal(monkeypatch):
+    import signal
+    import threading
+
+    original_start = threading.Thread.start
+
+    def start_and_interrupt(thread):
+        original_start(thread)
+        signal.raise_signal(signal.SIGINT)
+
+    monkeypatch.setattr(threading.Thread, "start", start_and_interrupt)
+    source = FiniteSource()
+    recorder = ContinuousRecorder(source)
+    previous_handler = signal.signal(signal.SIGINT, signal.default_int_handler)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            recorder.start()
+    finally:
+        signal.signal(signal.SIGINT, previous_handler)
+    assert recorder._thread is None
+    assert recorder._stop_event.is_set()
+    assert not source.running
+
+
+def test_recorder_preserves_start_error_if_cleanup_fails():
+    class BrokenSource(FiniteSource):
+        def start(self):
+            raise RuntimeError("start failure")
+
+        def stop(self):
+            raise RuntimeError("cleanup failure")
+
+    with pytest.raises(RuntimeError, match="start failure"):
+        ContinuousRecorder(BrokenSource()).start()
+
+
+def test_second_recorder_cannot_close_source_owned_by_first():
+    from bci_maze.lk_mini.source import _SourceAlreadyStarted
+
+    class OwnedSource(FiniteSource):
+        def start(self):
+            if self.running:
+                raise _SourceAlreadyStarted("Source already started")
+            super().start()
+
+    source = OwnedSource()
+    with ContinuousRecorder(source) as first:
+        with pytest.raises(RuntimeError, match="already started"):
+            ContinuousRecorder(source).start()
+        assert source.running
+        assert first.wait_for_samples(12, timeout=1)
+    assert not source.running

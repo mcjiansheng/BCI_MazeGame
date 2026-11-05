@@ -1,7 +1,9 @@
-import numpy as np
-import pytest
+import signal
 import sys
 import types
+
+import numpy as np
+import pytest
 
 from bci_maze.lk_mini.source import (
     BrainFlowSource,
@@ -15,6 +17,7 @@ from bci_maze.lk_mini.source import (
     build_channel_command,
     build_impedance_command,
 )
+from bci_maze.lk_mini import source as source_module
 
 
 def test_lk_channel_commands_match_vendor_protocol():
@@ -117,13 +120,8 @@ def test_chunk_segment_defaults_and_validation():
         EEGChunk(np.ones((1, 2)), np.asarray([0, 1]), segment_id=-1)
 
 
-@pytest.mark.parametrize("indices,names", [
-    (tuple(range(16)), DEFAULT_CHANNEL_NAMES),
-    ((15, 8, 0), ("CP2", "Fz", "FC3")),
-    (tuple(range(8)), LEGACY_CHANNEL_NAMES),
-])
-@pytest.mark.parametrize("gain", [6, 12, 24])
-def test_brainflow_source_uses_board_rows_and_timestamps(monkeypatch, indices, names, gain):
+@pytest.fixture
+def fake_brainflow(monkeypatch):
     calls = []
 
     class FakeParams:
@@ -194,7 +192,17 @@ def test_brainflow_source_uses_board_rows_and_timestamps(monkeypatch, indices, n
     package.board_shim = board_shim
     monkeypatch.setitem(sys.modules, "brainflow", package)
     monkeypatch.setitem(sys.modules, "brainflow.board_shim", board_shim)
+    return FakeBoard, calls
 
+
+@pytest.mark.parametrize("indices,names", [
+    (tuple(range(16)), DEFAULT_CHANNEL_NAMES),
+    ((15, 8, 0), ("CP2", "Fz", "FC3")),
+    (tuple(range(8)), LEGACY_CHANNEL_NAMES),
+])
+@pytest.mark.parametrize("gain", [6, 12, 24])
+def test_brainflow_source_uses_board_rows_and_timestamps(fake_brainflow, indices, names, gain):
+    _, calls = fake_brainflow
     source = BrainFlowSource(
         channel_indices=indices, channel_names=names, sample_rate=250, gain=gain
     )
@@ -210,6 +218,20 @@ def test_brainflow_source_uses_board_rows_and_timestamps(monkeypatch, indices, n
     assert calls[0] == "~6"
     assert calls[1] == build_all_channel_commands(indices, gain)
     assert calls[-2:] == ["stop", "release"]
+
+
+def test_interrupt_during_prepare_releases_brainflow_session(fake_brainflow, monkeypatch):
+    board, calls = fake_brainflow
+    prepare = board.prepare_session
+
+    def interrupted_prepare(self):
+        prepare(self)
+        signal.raise_signal(signal.SIGINT)
+
+    monkeypatch.setattr(board, "prepare_session", interrupted_prepare)
+    with pytest.raises(KeyboardInterrupt):
+        BrainFlowSource().start()
+    assert calls == ["release"]
 
 
 def test_cli_and_live_source_defaults_enable_both_banks():
@@ -246,29 +268,44 @@ def test_cli_requires_explicit_names_for_legacy_eight_channels():
     assert source_from_args(args).channel_names == LEGACY_CHANNEL_NAMES
 
 
+@pytest.fixture
+def fake_lsl(monkeypatch):
+    def install(stream_channels, chunks):
+        package = types.ModuleType("pylsl")
+
+        class FakeInfo:
+            def nominal_srate(self):
+                return 250
+
+            def channel_count(self):
+                return stream_channels
+
+        class FakeInlet:
+            def __init__(self, stream, **kwargs):
+                self.chunks = iter(chunks)
+
+            def info(self, **kwargs):
+                return FakeInfo()
+
+            def time_correction(self, *, timeout):
+                return 2.5
+
+            def pull_chunk(self, **kwargs):
+                return next(self.chunks)
+
+        package.StreamInlet = FakeInlet
+        package.resolve_byprop = lambda *args, **kwargs: [object()]
+        package.local_clock = lambda: 1000.0
+        monkeypatch.setitem(sys.modules, "pylsl", package)
+        monkeypatch.setattr(source_module, "time", types.SimpleNamespace(monotonic=lambda: 100.0))
+
+    return install
+
+
 @pytest.mark.parametrize("stream_channels", [8, 16])
-def test_lsl_reads_sixteen_channels_or_rejects_short_stream(monkeypatch, stream_channels):
-    class FakeInfo:
-        def nominal_srate(self):
-            return 250
-
-        def channel_count(self):
-            return stream_channels
-
-    class FakeInlet:
-        def __init__(self, stream, **kwargs):
-            pass
-
-        def info(self, **kwargs):
-            return FakeInfo()
-
-        def pull_chunk(self, **kwargs):
-            return [list(range(16)), list(range(100, 116))], [1.0, 1.004]
-
-    package = types.ModuleType("pylsl")
-    package.StreamInlet = FakeInlet
-    package.resolve_byprop = lambda *args, **kwargs: [object()]
-    monkeypatch.setitem(sys.modules, "pylsl", package)
+def test_lsl_reads_sixteen_channels_or_rejects_short_stream(fake_lsl, stream_channels):
+    raw = [997.48, 997.496]
+    fake_lsl(stream_channels, [([list(range(16)), list(range(100, 116))], raw)])
     source = LSLSource()
     if stream_channels == 8:
         with pytest.raises(RuntimeError, match="channel 16 was requested"):
@@ -279,4 +316,43 @@ def test_lsl_reads_sixteen_channels_or_rejects_short_stream(monkeypatch, stream_
         assert chunk.data.shape == (16, 2)
         assert chunk.data[8].tolist() == [8, 108]
         assert chunk.data[15].tolist() == [15, 115]
-        assert chunk.monotonic_timestamps.tolist() == [1.0, 1.004]
+        assert chunk.monotonic_timestamps == pytest.approx([99.98, 99.996])
+        assert chunk.received_timestamps.tolist() == raw
+
+
+@pytest.mark.parametrize(("stamp", "message"), [
+    (np.nan, "finite"),
+    (997.48, "discontinuity"),
+])
+def test_lsl_rejects_invalid_raw_timing_across_reads(fake_lsl, stamp, message):
+    fake_lsl(16, [([[0] * 16], [997.496]), ([[0] * 16], [stamp])])
+    with LSLSource() as source:
+        assert source.read().data.shape == (16, 1)
+        with pytest.raises(ValueError, match=message):
+            source.read()
+
+
+def test_lsl_splits_gaps_within_and_between_pulls(fake_lsl):
+    stamps = [[997.48, 997.496, 997.996], [999.996, 1000], []]
+    fake_lsl(16, [([[0] * 16 for _ in row], row) for row in stamps])
+    with LSLSource() as source:
+        for expected_segment, raw in enumerate([stamps[0][:2], stamps[0][2:], stamps[1]]):
+            chunk = source.read()
+            assert source.segment_id == chunk.segment_id == expected_segment
+            assert chunk.received_timestamps.tolist() == raw
+        empty = source.read()
+        assert empty.data.shape[1] == 0 and empty.segment_id == 2
+
+
+def test_lsl_rejected_nested_start_preserves_pending_samples(fake_lsl):
+    fake_lsl(16, [([[0] * 16, [1] * 16], [997.48, 997.98]), ([], [])])
+    with LSLSource() as source:
+        first = source.read()
+        assert first.segment_id == 0 and first.data[0].tolist() == [0]
+        with pytest.raises(RuntimeError, match="already started"):
+            with source:
+                pytest.fail("a nested context acquired the same LSL source")
+        pending = source.read()
+        assert pending.segment_id == 1 and pending.data[0].tolist() == [1]
+        assert pending.received_timestamps.tolist() == [997.98]
+        assert source.read().data.shape[1] == 0

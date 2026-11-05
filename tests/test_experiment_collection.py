@@ -85,6 +85,15 @@ def test_cross_segment_between_baseline_and_task_is_rejected():
         collection.extract_trial_pair(Recorder(), (0, 0), (300, 1), 100)
 
 
+@pytest.fixture(autouse=True)
+def restore_sigint_handler():
+    previous = signal.getsignal(signal.SIGINT)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGINT, previous)
+
+
 @pytest.fixture
 def collection_harness(tmp_path):
     source = SimpleNamespace(sample_rate=100, channel_names=("C3", "C4"), recovery_stats={}, recovery_events=[])
@@ -124,6 +133,9 @@ def collection_harness(tmp_path):
 
         def snapshot(self):
             return self.segment(0, self.sample_count), np.arange(self.sample_count) / 100
+
+        def snapshot_received_timestamps(self):
+            return np.full(self.sample_count, np.nan)
 
         def snapshot_segment_ids(self):
             return np.zeros(self.sample_count, dtype=np.int64)
@@ -191,65 +203,49 @@ def test_worker_stop_is_deferred_through_snapshots_until_npz_exists(collection_h
     harness = collection_harness
     harness.display.interrupt_second_trial = False
     monkeypatch.setattr(job_worker, "_stop_delivered", threading.Event())
-    monkeypatch.setattr(job_worker, "_deferred_notice", threading.Event())
+    signal.signal(signal.SIGINT, job_worker.stop_signal_handler)
     visited = []
 
     def protect_snapshot(method, name):
         def checked():
             visited.append(name)
-            # Use the actual dashboard handler with the live acquisition stack.
-            job_worker.stop_signal_handler(signal.SIGINT, sys._getframe())
+            # Send SIGINT through the installed explicit critical-section handler.
+            signal.raise_signal(signal.SIGINT)
             assert not job_worker._stop_delivered.is_set()
-            assert job_worker._deferred_notice.is_set()
             return method()
         return checked
 
     monkeypatch.setattr(harness.recorder, "snapshot", protect_snapshot(harness.recorder.snapshot, "continuous"))
     monkeypatch.setattr(harness.recorder, "snapshot_segment_ids",
                         protect_snapshot(harness.recorder.snapshot_segment_ids, "segments"))
-    result = harness.run()
+    with pytest.raises(KeyboardInterrupt):
+        harness.run()
     assert visited == ["continuous", "segments"]
-    assert result.completed == 2 and result.path.is_file()
-    with np.load(result.path, allow_pickle=False) as saved:
+    assert job_worker._stop_delivered.is_set()
+    with np.load(harness.args.recording_output, allow_pickle=False) as saved:
         assert saved["epochs"].shape == (2, 2, 400)
         assert saved["baseline_epochs"].shape == (2, 2, 200)
+    job_worker.stop_signal_handler(signal.SIGINT, None)
     assert harness.display.close_calls == harness.recorder.stop_calls == 1
-
-    # Once protected finalization has finished, deliver the pending stop once.
-    with pytest.raises(KeyboardInterrupt):
-        job_worker.stop_signal_handler(signal.SIGINT, sys._getframe())
-    assert job_worker._stop_delivered.is_set()
-    job_worker.stop_signal_handler(signal.SIGINT, sys._getframe())
-    assert harness.display.close_calls == harness.recorder.stop_calls == 1
-    assert result.path.is_file()
 
 
 @pytest.mark.parametrize("interrupt_count", [1, 2])
-def test_finish_retries_one_interrupt_and_preserves_repeated_stop(collection_harness, monkeypatch, interrupt_count):
+def test_finalization_defers_repeated_stop_and_writes_once(collection_harness, monkeypatch, interrupt_count):
     harness = collection_harness
     harness.display.interrupt_second_trial = False
     snapshot = harness.recorder.snapshot
-    calls = 0
-
+    calls = []
     def interrupted_snapshot():
-        nonlocal calls
-        calls += 1
-        if calls <= interrupt_count:
-            raise KeyboardInterrupt
+        calls.append(True)
+        for _ in range(interrupt_count):
+            signal.raise_signal(signal.SIGINT)
         return snapshot()
-
     monkeypatch.setattr(harness.recorder, "snapshot", interrupted_snapshot)
-    if interrupt_count == 2:
-        with pytest.raises(KeyboardInterrupt):
-            harness.run()
-        assert not harness.args.recording_output.exists()
-    else:
-        result = harness.run()
-        assert result.interrupted and result.completed == 2 and result.path.is_file()
-        with np.load(result.path, allow_pickle=False) as saved:
-            assert metadata(saved)["configuration"]["capture_interrupted"] is True
-            assert len(saved["epochs"]) == len(saved["baseline_epochs"]) == 2
-    assert calls == 2
+    with pytest.raises(KeyboardInterrupt):
+        harness.run()
+    assert len(calls) == 1
+    with np.load(harness.args.recording_output, allow_pickle=False) as saved:
+        assert len(saved["epochs"]) == len(saved["baseline_epochs"]) == 2
     assert harness.display.close_calls == harness.recorder.stop_calls == 1
 
 
@@ -391,7 +387,7 @@ def test_failed_atomic_save_keeps_existing_output(tmp_path, monkeypatch):
     original.write_bytes(b"prior recording")
     def fail_replace(*args):
         raise OSError("disk rename failed")
-    monkeypatch.setattr(collection.os, "replace", fail_replace)
+    monkeypatch.setattr("bci_maze.lk_mini.recording.os.replace", fail_replace)
     with pytest.raises(OSError, match="rename"):
         collection.create_demo_recording(original, experiment="imagery", subject="S01", session="atomic")
     assert original.read_bytes() == b"prior recording"
@@ -459,7 +455,7 @@ def test_worker_stop_during_trial_commit_keeps_arrays_and_counts_aligned(
     h.display.interrupt_second_trial = False
     h.display.artifact = artifact
     monkeypatch.setattr(job_worker, "_stop_delivered", threading.Event())
-    monkeypatch.setattr(job_worker, "_deferred_notice", threading.Event())
+    signal.signal(signal.SIGINT, job_worker.stop_signal_handler)
     source, first_line = inspect.getsourcelines(collection.collect_experiment)
     target = next(first_line + index for index, line in enumerate(source) if line.strip().startswith(point))
     injected = []
@@ -469,16 +465,15 @@ def test_worker_stop_during_trial_commit_keeps_arrays_and_counts_aligned(
                 and frame.f_lineno == target):
             injected.append(frame.f_lineno)
             # This lands after trials.append, or after the usable counter update.
-            # Use the same handler and live stack inspection as the real worker.
-            job_worker.stop_signal_handler(signal.SIGINT, frame)
+            # Send the same SIGINT as the dashboard worker.
+            signal.raise_signal(signal.SIGINT)
             assert not job_worker._stop_delivered.is_set()
-            assert job_worker._deferred_notice.is_set()
         return trace
 
     show = h.display.show
     def deliver_after_commit(title, *args):
         if title == "休息" and injected:
-            job_worker.stop_signal_handler(signal.SIGINT, sys._getframe())
+            signal.raise_signal(signal.SIGINT)
         return show(title, *args)
     monkeypatch.setattr(h.display, "show", deliver_after_commit)
     previous_trace = sys.gettrace()
@@ -505,3 +500,29 @@ def test_worker_stop_during_trial_commit_keeps_arrays_and_counts_aligned(
         assert info["trial_summary"]["attempts"] == 1
     job_worker.stop_signal_handler(signal.SIGINT, sys._getframe())
     assert h.display.close_calls == h.recorder.stop_calls == 1
+
+
+def test_paired_recording_compresses_once(tmp_path, monkeypatch):
+    writes = []
+    save = np.savez_compressed
+    def counted(*args, **kwargs):
+        writes.append(set(kwargs))
+        return save(*args, **kwargs)
+    monkeypatch.setattr(np, "savez_compressed", counted)
+    path = collection.create_demo_recording(tmp_path / "paired.npz", experiment="imagery",
+                                            subject="S01", session="once", trials_per_class=1, blocks=1)
+    assert len(writes) == 1
+    assert {"continuous", "epochs", "baseline_epochs", "metadata_json"} <= writes[0]
+    with np.load(path, allow_pickle=False) as saved:
+        assert saved["epochs"].shape == (2, 16, 1000)
+        assert saved["baseline_epochs"].shape == (2, 16, 500)
+
+
+def test_numpy_integer_schedule_and_boolean_rejection():
+    for trials, blocks in [(np.int64(2), np.int32(1)), (np.uint64(2), 1), (2, np.uint64(1))]:
+        assert len(collection.make_schedule(trials, blocks, 42)) == 4
+    for trials, blocks in [(True, 1), (2, np.bool_(True))]:
+        with pytest.raises(ValueError):
+            collection.make_schedule(trials, blocks, 42)
+    with pytest.raises(ValueError):
+        collection.make_schedule(np.uint64(2**53 + 1), 2, 42)

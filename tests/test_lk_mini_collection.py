@@ -94,6 +94,9 @@ def test_collection_saves_completed_trials_before_reraising_stream_error(
         def snapshot_segment_ids(self):
             return np.zeros(self.source.sample_rate * 2, dtype=np.int64)
 
+        def snapshot_received_timestamps(self):
+            return np.arange(self.source.sample_rate * 2) / self.source.sample_rate
+
     output = tmp_path / "partial.npz"
     fake_source = FakeSource()
     monkeypatch.setattr(collect_lk_mi, "CueDisplay", FakeDisplay)

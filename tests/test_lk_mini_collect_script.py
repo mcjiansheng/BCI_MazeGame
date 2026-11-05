@@ -41,6 +41,9 @@ def test_collection_saves_completed_trial_and_records_interrupted_trial(monkeypa
         def snapshot(self):
             return np.ones((2, 20)), np.r_[np.arange(10) / 10, 3 + np.arange(10) / 10]
 
+        def snapshot_received_timestamps(self):
+            return np.full(self.snapshot()[1].shape, np.nan)
+
         def snapshot_segment_ids(self):
             return np.repeat([0, 1], 10)
 

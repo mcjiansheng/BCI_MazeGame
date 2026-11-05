@@ -1,6 +1,7 @@
 from collections import deque
 import argparse
 import errno
+import signal
 import time
 import types
 
@@ -10,15 +11,16 @@ import pytest
 from bci_maze.lk_mini import recovery
 from bci_maze.lk_mini.cli import add_source_arguments, source_from_args
 from bci_maze.lk_mini.recovery import RecoveringBrainFlowSource, is_transport_error
-from bci_maze.lk_mini.source import BrainFlowSource, EEGChunk, EEGTransportError, DEFAULT_CHANNEL_NAMES
+from bci_maze.lk_mini.source import BrainFlowSource, EEGTransportError
 
 
 class FakeContext:
     """In-process protocol peer; all waits are controlled explicitly by the test."""
 
-    def __init__(self, sessions, *, hung=False):
+    def __init__(self, sessions, *, hung=False, interrupt_start=False):
         self.sessions = deque(sessions)
         self.hung = hung
+        self.interrupt_start = interrupt_start
         self.processes = []
         self.parent = None
 
@@ -66,6 +68,8 @@ class FakeContext:
                 self.alive = True
                 self.connection.messages.extend(context.sessions.popleft())
                 context.processes.append(self)
+                if context.interrupt_start:
+                    signal.raise_signal(signal.SIGINT)
 
             def is_alive(self):
                 return self.alive
@@ -96,7 +100,7 @@ def clock(monkeypatch):
 
 
 def ready():
-    return ("ready", 250, DEFAULT_CHANNEL_NAMES)
+    return ("ready",)
 
 
 def data(at=100.0):
@@ -224,6 +228,46 @@ def test_configuration_is_validated_before_starting_worker():
         RecoveringBrainFlowSource(session_parameters={"sample_rate": 123})
     with pytest.raises(ValueError, match="no_data_timeout"):
         RecoveringBrainFlowSource(no_data_timeout=float("nan"))
+
+
+@pytest.mark.parametrize(("parameters", "field"), [
+    ({"gain": 24.5}, "gain"),
+    ({"gain": True}, "gain"),
+    ({"ip_port": 12345.25}, "ip_port"),
+    ({"ip_port": False}, "ip_port"),
+    ({"sample_rate": 250.5}, "sample rate"),
+])
+def test_fractional_and_boolean_board_settings_fail_before_start(parameters, field):
+    with pytest.raises(ValueError, match=field):
+        RecoveringBrainFlowSource(session_parameters=parameters)
+
+
+def test_integer_valued_float_settings_are_preserved():
+    source = RecoveringBrainFlowSource(session_parameters={
+        "gain": 24.0, "ip_port": 12345.0, "sample_rate": 250.0,
+    })
+    assert (source.gain, source.ip_port, source.sample_rate) == (24, 12345, 250)
+
+
+def test_interrupt_after_process_start_closes_owned_worker(clock):
+    context = FakeContext([[ready()]], interrupt_start=True)
+    source = RecoveringBrainFlowSource(_context=context)
+    with pytest.raises(KeyboardInterrupt):
+        with source:
+            pytest.fail("cancelled startup entered the source context")
+    assert len(context.processes) == 1
+    assert context.processes[0].closed and not context.processes[0].alive
+    assert context.parent.closed
+    assert source.connection_state == "stopped"
+
+
+def test_rejected_nested_start_leaves_outer_session_running(clock):
+    source, _ = source_for([[ready(), data()]])
+    with source:
+        with pytest.raises(RuntimeError, match="already started"):
+            with source:
+                pytest.fail("a nested context acquired the same source")
+        assert next_data(source).data.shape[1] == 2
 
 
 def test_stop_during_backoff_prevents_new_session(clock):

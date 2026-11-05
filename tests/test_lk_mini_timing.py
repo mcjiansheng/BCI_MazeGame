@@ -1,3 +1,5 @@
+import json
+
 import numpy as np
 import pytest
 
@@ -21,15 +23,47 @@ def test_stream_rejects_gap_between_chunks():
         guard.check(np.asarray([1.5, 1.504]))
 
 
-def test_replay_does_not_hide_recorded_gaps(tmp_path):
+@pytest.mark.parametrize(("stamp", "message"), [
+    (np.nan, "finite"),
+    (1.003, "discontinuity"),
+    (1.5, "discontinuity"),
+])
+def test_replay_rejects_bad_recorded_timing_across_reads(tmp_path, stamp, message):
     path = tmp_path / "gap.npz"
-    np.savez(path, data=np.ones((2, 4)), sample_rate=250,
-             channel_names=["C3", "C4"], timestamps=[1, 1.004, 1.5, 1.504])
-    with ReplaySource(path, realtime=False) as source:
-        chunk = source.read()
-    assert np.isclose(np.diff(chunk.monotonic_timestamps)[1], 0.496)
-    with pytest.raises(ValueError, match="discontinuity"):
-        StreamTimingGuard(250).check(chunk.monotonic_timestamps)
+    np.savez(path, data=np.ones((2, 3)), sample_rate=250,
+             channel_names=["C3", "C4"], timestamps=[1, 1.004, stamp])
+    with ReplaySource(path, realtime=False, chunk_samples=2) as source:
+        assert source.read().data.shape[1] == 2
+        with pytest.raises(ValueError, match=message):
+            source.read()
+
+
+def test_replay_preserves_lsl_jitter_and_rejects_reverse_order(tmp_path):
+    path = tmp_path / "lsl.npz"
+    np.savez(path, data=np.ones((2, 3)), sample_rate=250, channel_names=["C3", "C4"],
+             timestamps=[1, 1.016, 1.014],
+             metadata_json=json.dumps({"configuration": {"backend": "lsl"}}))
+    with ReplaySource(path, realtime=False, chunk_samples=2) as source:
+        assert np.diff(source.read().monotonic_timestamps) == pytest.approx([0.016])
+        with pytest.raises(ValueError, match="discontinuity"):
+            source.read()
+
+
+@pytest.mark.parametrize("recorded_boundary", [True, False])
+def test_replay_requires_segment_for_large_lsl_gap(tmp_path, recorded_boundary):
+    path = tmp_path / "lsl-gap.npz"
+    np.savez(path, data=np.ones((2, 3)), sample_rate=250, channel_names=["C3", "C4"],
+             timestamps=[1, 1.016, 1.516], segment_ids=[0, 0, int(recorded_boundary)],
+             metadata_json=json.dumps({"configuration": {"backend": "lsl"}}))
+    with ReplaySource(path, realtime=False, chunk_samples=2) as source:
+        first = source.read()
+        if recorded_boundary:
+            second = source.read()
+            assert second.segment_id == 1
+            assert second.monotonic_timestamps[0] - first.monotonic_timestamps[-1] == pytest.approx(0.5)
+        else:
+            with pytest.raises(ValueError, match="discontinuity"):
+                source.read()
 
 
 @pytest.mark.parametrize("value", [np.nan, np.inf])

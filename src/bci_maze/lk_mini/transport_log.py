@@ -9,6 +9,8 @@ from pathlib import Path
 
 import numpy as np
 
+from .timing import count_discontinuities, timestamp_intervals
+
 
 class TransportLogger:
     def __init__(self, path: Path | None):
@@ -70,9 +72,10 @@ class TransportLogger:
         self.previous_recovering = recovering
         if not count:
             return
-        timestamps = np.asarray(chunk.monotonic_timestamps, dtype=np.float64)
+        timestamps = chunk.monotonic_timestamps
+        validated = getattr(source, "validates_timing", False)
         nonfinite_data = int(np.count_nonzero(~np.isfinite(chunk.data)))
-        nonfinite_times = int(np.count_nonzero(~np.isfinite(timestamps)))
+        nonfinite_times = 0 if validated else int(np.count_nonzero(~np.isfinite(timestamps)))
         self.nonfinite_data_values += nonfinite_data
         self.nonfinite_timestamps += nonfinite_times
         entry = self.segments.get(segment)
@@ -84,9 +87,8 @@ class TransportLogger:
                      "max_read_gap_seconds": 0.0}
             self.segments[segment] = entry
         previous_timestamp = entry.get("last_sample_timestamp")
-        joined = timestamps if previous_timestamp is None else np.r_[previous_timestamp, timestamps]
-        intervals = np.diff(joined)
-        invalid = int(np.count_nonzero(~np.isfinite(intervals) | (intervals <= 0) | (intervals > 2.5 / self.sample_rate)))
+        intervals = timestamp_intervals(timestamps, previous_timestamp)
+        invalid = 0 if validated else count_discontinuities(intervals, 2.5 / self.sample_rate)
         if "last_read_monotonic" in entry:
             entry["max_read_gap_seconds"] = max(entry["max_read_gap_seconds"], now - entry["last_read_monotonic"])
         entry.update(last_read_monotonic=now, last_read_elapsed=now - self.started,

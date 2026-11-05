@@ -10,31 +10,12 @@ import sys
 import threading
 
 
-PROTECTED_FUNCTIONS = {
-    "save_mi_recording", "save_synthetic_mi_recording", "save_model_bundle", "save_semhaf_bundle",
-    "stop", "close", "__exit__", "finish",
-}
 _stop_delivered = threading.Event()
-_deferred_notice = threading.Event()
 _signal_lock = threading.RLock()
 
 
 def stop_signal_handler(_signum, frame) -> None:
-    """Complete a file write or resource release before honoring a late stop.
-
-    Signal handlers execute on the main thread. Checking the live call stack
-    avoids a race between a watcher thread observing a flag and signal delivery.
-    The watcher retries deferred requests until the workflow finishes or one
-    interrupt is delivered. A delivered interrupt is never repeated in cleanup.
-    """
-    current = frame
-    while current is not None:
-        if current.f_code.co_name in PROTECTED_FUNCTIONS:
-            if not _deferred_notice.is_set():
-                _deferred_notice.set()
-                print("正在完成文件保存或资源清理，等待当前步骤结束。", flush=True)
-            return
-        current = current.f_back
+    """Deliver a dashboard stop once; explicit critical sections defer SIGINT."""
     with _signal_lock:
         if _stop_delivered.is_set():
             return
@@ -48,7 +29,6 @@ def main() -> int:
     sys.argv = sys.argv[2:]
     finished = threading.Event()
     _stop_delivered.clear()
-    _deferred_notice.clear()
     signal.signal(signal.SIGINT, stop_signal_handler)
 
     def watch_stop() -> None:

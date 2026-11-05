@@ -13,6 +13,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from bci_maze.lk_mini.cli import add_source_arguments, source_from_args
+from bci_maze.stopping import defer_stop
 from bci_maze.lk_mini.model import load_model_bundle
 from bci_maze.lk_mini.display import configure_plot_fonts
 from bci_maze.lk_mini.timing import StreamTimingGuard
@@ -39,9 +40,10 @@ def game_lifetime(game):
     try:
         yield
     finally:
-        if game is not None:
-            game.set_stream_ready(False)
-            game.close()
+        with defer_stop():
+            if game is not None:
+                game.set_stream_ready(False)
+                game.close()
 
 
 def main() -> int:
@@ -133,7 +135,7 @@ def main() -> int:
             started = time.monotonic()
             transport.start(started, sample_rate, channel_names, window_samples)
             deadline = started + args.duration if args.duration > 0 else float("inf")
-            timing = StreamTimingGuard(sample_rate)
+            timing = None if getattr(source, "validates_timing", False) else StreamTimingGuard(sample_rate)
             last_sample_time = started
             current_segment = 0
             was_recovering = False
@@ -156,7 +158,8 @@ def main() -> int:
                     transport.write("window_reset", read_monotonic, window_reset_id=window_reset_id,
                                     segment_id=current_segment, reason="stream_recovering" if recovering else "segment_changed")
                     smoother.reset()
-                    timing = StreamTimingGuard(sample_rate)
+                    if timing is not None:
+                        timing = StreamTimingGuard(sample_rate)
                     samples_since_decision = 0
                     last_command_time = -1e9
                     last_sample_time = time.monotonic()
@@ -207,7 +210,8 @@ def main() -> int:
                         )
                     continue
                 last_sample_time = time.monotonic()
-                timing.check(chunk.monotonic_timestamps)
+                if timing is not None:
+                    timing.check(chunk.monotonic_timestamps)
                 data = chunk.data
                 data_timestamps = chunk.monotonic_timestamps
                 if game_snapshot is not None and game_snapshot.phase == "waiting":
@@ -247,6 +251,8 @@ def main() -> int:
                     "bad_channels": bad_channels,
                     "model_origin": provenance.get("data_origin", "unspecified"),
                     "model_subject": bundle.subject_id,
+                    "calibration_passed": provenance.get("calibration_passed", False),
+                    "control_validated": provenance.get("control_validated", False),
                 }
                 if game_snapshot is not None:
                     record["game"] = {"phase": game_snapshot.phase, "visit_token": game_snapshot.visit_token, "mapping": {label: game_snapshot.command_for(label) for label in bundle.classes}, "control_provenance": provenance}
@@ -319,8 +325,6 @@ def main() -> int:
     finally:
         transport.finish(source, capture_end=capture_end, error=capture_error)
         if game is not None:
-            game.set_stream_ready(False)
-            game.close()
             with decisions_path.open("a", encoding="utf-8") as log_file:
                 for event in game.drain_events():
                     log_file.write(json.dumps({"timestamp_utc": datetime.now(timezone.utc).isoformat(), "event": "unity", "reason": "unity_cleanup", "label": "unknown", **event}, ensure_ascii=False) + "\n")

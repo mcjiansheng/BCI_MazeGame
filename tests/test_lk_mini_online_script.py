@@ -83,6 +83,7 @@ def test_online_rewarms_after_empty_recovery_chunk_without_mixing_segments(monke
     monkeypatch.setattr(source, "stop", stop_source)
     monkeypatch.setattr(sys, "argv", ["online", "--model", "unused", "--step-seconds", "0.2", "--history", "3", "--log", str(log), "--transport-log", str(transport_log), "--unity-host", "localhost", "--allow-unvalidated-control"])
     assert online_lk_mi.main() == 0
+    assert cleanup_order == ["game", "source"]
     records = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
     assert [record["reason"] for record in records] == [
         "warming_up", "warming_up", "stream_recovering", "warming_up", "warming_up", "accepted",

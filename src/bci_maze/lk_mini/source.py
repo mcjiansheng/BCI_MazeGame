@@ -6,13 +6,20 @@ training and automated tests run on machines without BrainFlow or pylsl.
 
 from __future__ import annotations
 
+import json
 import time
 from abc import ABC, abstractmethod
+from collections import deque
 from dataclasses import dataclass
+from numbers import Real
 from pathlib import Path
 from typing import Sequence
 
 import numpy as np
+
+from bci_maze.stopping import defer_stop
+
+from .timing import StreamTimingGuard
 
 
 LEGACY_CHANNEL_NAMES = ("FC3", "FC4", "C3", "Cz", "C4", "CP3", "CPz", "CP4")
@@ -23,6 +30,14 @@ DEFAULT_CHANNEL_INDICES = tuple(range(len(DEFAULT_CHANNEL_NAMES)))
 CHANNEL_CODES = "12345678QWERTYUI"
 RATE_COMMANDS = {250: "~6", 500: "~5", 1000: "~4"}
 GAIN_CODES = {1: 0, 2: 1, 4: 2, 6: 3, 8: 4, 12: 5, 24: 6}
+# Capture continuity tolerance for jittery LSL sender stamps.
+LSL_MAX_GAP_SECONDS = 0.1
+
+
+def _lsl_max_sample_gap(value: float) -> float:
+    if not isinstance(value, Real) or isinstance(value, bool) or not np.isfinite(value) or value <= 0:
+        raise ValueError("LSL max_sample_gap must be finite and positive")
+    return float(value)
 
 
 def _validate_channel_selection(
@@ -41,7 +56,7 @@ def _validate_channel_selection(
 
 @dataclass(frozen=True)
 class EEGChunk:
-    """One chunk of EEG in microvolts, shaped channels x samples."""
+    """EEG in microvolts, shaped channels x samples, with optional raw transport stamps."""
 
     data: np.ndarray
     monotonic_timestamps: np.ndarray
@@ -59,6 +74,15 @@ class EEGChunk:
             raise ValueError("segment_id must be a non-negative integer")
         object.__setattr__(self, "data", data)
         object.__setattr__(self, "monotonic_timestamps", timestamps)
+        if self.received_timestamps is not None:
+            received = np.asarray(self.received_timestamps, dtype=np.float64)
+            if received.shape != timestamps.shape:
+                raise ValueError("One raw transport timestamp is required per EEG sample")
+            object.__setattr__(self, "received_timestamps", received)
+
+
+class _SourceAlreadyStarted(RuntimeError):
+    """A rejected second start does not transfer ownership of the active session."""
 
 
 class EEGSource(ABC):
@@ -67,6 +91,8 @@ class EEGSource(ABC):
     sample_rate: int
     channel_names: tuple[str, ...]
     segment_id: int = 0
+    # Sources opt in when they validate external timing or generate it themselves.
+    validates_timing = False
 
     @property
     def stream_segment_id(self) -> int:
@@ -105,8 +131,17 @@ class EEGSource(ABC):
         """Stop streaming and release all resources."""
 
     def __enter__(self) -> "EEGSource":
-        self.start()
-        return self
+        try:
+            self.start()
+            return self
+        except _SourceAlreadyStarted:
+            raise
+        except BaseException:
+            try:
+                self.stop()
+            except BaseException:
+                pass  # Keep the startup error.
+            raise
 
     def __exit__(self, exc_type, exc, traceback) -> None:
         self.stop()
@@ -156,49 +191,56 @@ def build_impedance_command(channel_index: int, p_input: bool = True, n_input: b
     return f"z{CHANNEL_CODES[channel_index]}{int(p_input)}{int(n_input)}Z"
 
 
-def _host_timestamps(sample_count: int, sample_rate: int) -> np.ndarray:
-    if sample_count <= 0:
-        return np.empty(0, dtype=np.float64)
-    end = time.monotonic()
-    return end - np.arange(sample_count - 1, -1, -1, dtype=np.float64) / sample_rate
-
-
 class EEGTransportError(RuntimeError):
     """An interrupted transport or device sequence requires a new session."""
+
+
+def _config_integer(value, name: str) -> int:
+    try:
+        integer = int(value)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError(f"{name} must be an integer") from error
+    if isinstance(value, (bool, np.bool_)) or (not isinstance(value, str) and value != integer):
+        raise ValueError(f"{name} must be an integer")
+    return integer
+
+
+def _brainflow_config(
+    *,
+    ip_address: str = "192.168.4.1",
+    ip_port: int = 12345,
+    sample_rate: int = 250,
+    channel_indices: Sequence[int] = DEFAULT_CHANNEL_INDICES,
+    channel_names: Sequence[str] = DEFAULT_CHANNEL_NAMES,
+    gain: int = 24,
+    timeout: int = 5,
+) -> dict:
+    rate = _config_integer(sample_rate, "sample rate")
+    if isinstance(sample_rate, str) or rate not in RATE_COMMANDS:
+        raise ValueError(f"Unsupported sample rate: {sample_rate}")
+    indices, names = _validate_channel_selection(channel_indices, channel_names)
+    if any(index >= 16 for index in indices):
+        raise ValueError("LK-Mini channel indices must be between 0 and 15")
+    port = _config_integer(ip_port, "ip_port")
+    if not 1 <= port <= 65535:
+        raise ValueError("ip_port must be between 1 and 65535")
+    configured_gain = _config_integer(gain, "gain")
+    if configured_gain not in GAIN_CODES:
+        raise ValueError(f"Unsupported gain {gain}; choose from {tuple(GAIN_CODES)}")
+    device_timeout = _config_integer(timeout, "timeout")
+    if device_timeout <= 0:
+        raise ValueError("timeout must be positive")
+    return dict(ip_address=ip_address, ip_port=port, sample_rate=rate,
+                channel_indices=indices, channel_names=names, gain=configured_gain, timeout=device_timeout)
 
 
 class BrainFlowSource(EEGSource):
     """Direct BrainFlow connection to LK-Mini as a Cyton+Daisy Wi-Fi board."""
 
-    def __init__(
-        self,
-        *,
-        ip_address: str = "192.168.4.1",
-        ip_port: int = 12345,
-        sample_rate: int = 250,
-        channel_indices: Sequence[int] = DEFAULT_CHANNEL_INDICES,
-        channel_names: Sequence[str] = DEFAULT_CHANNEL_NAMES,
-        gain: int = 24,
-        timeout: int = 5,
-    ):
-        if sample_rate not in RATE_COMMANDS:
-            raise ValueError(f"Unsupported sample rate: {sample_rate}")
-        indices, names = _validate_channel_selection(channel_indices, channel_names)
-        if any(index >= 16 for index in indices):
-            raise ValueError("LK-Mini channel indices must be between 0 and 15")
-        if not 1 <= int(ip_port) <= 65535:
-            raise ValueError("ip_port must be between 1 and 65535")
-        if int(gain) not in GAIN_CODES:
-            raise ValueError(f"Unsupported gain {gain}; choose from {tuple(GAIN_CODES)}")
-        if int(timeout) <= 0:
-            raise ValueError("timeout must be positive")
-        self.ip_address = ip_address
-        self.ip_port = int(ip_port)
-        self.sample_rate = int(sample_rate)
-        self.channel_indices = indices
-        self.channel_names = names
-        self.gain = int(gain)
-        self.timeout = int(timeout)
+    validates_timing = True
+
+    def __init__(self, **session_parameters):
+        self.__dict__.update(_brainflow_config(**session_parameters))
         self._board = None
         self._brainflow_eeg_channels: list[int] = []
         self._timestamp_channel: int | None = None
@@ -209,7 +251,7 @@ class BrainFlowSource(EEGSource):
 
     def start(self) -> None:
         if self._board is not None:
-            raise RuntimeError("BrainFlow session is already started")
+            raise _SourceAlreadyStarted("BrainFlow session is already started")
         try:
             from brainflow.board_shim import BoardIds, BoardShim, BrainFlowInputParams
         except ImportError as exception:
@@ -223,8 +265,9 @@ class BrainFlowSource(EEGSource):
         board = BoardShim(board_id, params)
         prepared_here = False
         try:
-            board.prepare_session()
-            prepared_here = True
+            with defer_stop():
+                board.prepare_session()
+                prepared_here = True
             board.config_board(RATE_COMMANDS[self.sample_rate])
             time.sleep(0.25)
             board.config_board(build_all_channel_commands(self.channel_indices, self.gain))
@@ -239,21 +282,23 @@ class BrainFlowSource(EEGSource):
                 )
             board.start_stream(45000)
             board.get_board_data()
+            self._brainflow_eeg_channels = eeg_channels
+            self._timestamp_channel = timestamp_channel
+            self._package_channel = package_channel
+            self._previous_package = None
+            self._sample_position = 0
+            self._sample_origin = None
+            self._board = board
         except BaseException:
             # Cleanup must not replace the original initialization exception.
             try:
-                if prepared_here and board.is_prepared():
-                    board.release_session()
-            except Exception:
+                with defer_stop():
+                    self._board = None
+                    if prepared_here and board.is_prepared():
+                        board.release_session()
+            except BaseException:
                 pass
             raise
-        self._board = board
-        self._brainflow_eeg_channels = eeg_channels
-        self._timestamp_channel = timestamp_channel
-        self._package_channel = package_channel
-        self._previous_package = None
-        self._sample_position = 0
-        self._sample_origin = None
 
     def read(self, timeout: float = 0.25) -> EEGChunk:
         if self._board is None:
@@ -291,6 +336,7 @@ class BrainFlowSource(EEGSource):
                 )
             time.sleep(0.005)
 
+    @defer_stop()
     def stop(self) -> None:
         board, self._board = self._board, None
         self._timestamp_channel = None
@@ -311,6 +357,8 @@ class BrainFlowSource(EEGSource):
 class LSLSource(EEGSource):
     """Subscribe to an OpenBCI GUI LSL time-series stream."""
 
+    validates_timing = True
+
     def __init__(
         self,
         *,
@@ -320,6 +368,7 @@ class LSLSource(EEGSource):
         channel_indices: Sequence[int] = DEFAULT_CHANNEL_INDICES,
         channel_names: Sequence[str] = DEFAULT_CHANNEL_NAMES,
         resolve_timeout: float = 10.0,
+        max_sample_gap: float = LSL_MAX_GAP_SECONDS,
     ):
         indices, names = _validate_channel_selection(channel_indices, channel_names)
         if sample_rate <= 0:
@@ -332,11 +381,15 @@ class LSLSource(EEGSource):
         self.channel_indices = indices
         self.channel_names = names
         self.resolve_timeout = float(resolve_timeout)
+        self.max_sample_gap = _lsl_max_sample_gap(max_sample_gap)
         self._inlet = None
+        self._pending_chunks: deque[EEGChunk] = deque()
 
     def start(self) -> None:
+        if self._inlet is not None:
+            raise _SourceAlreadyStarted("LSL source is already started")
         try:
-            from pylsl import StreamInlet, resolve_byprop
+            from pylsl import StreamInlet, local_clock, resolve_byprop
         except ImportError as exception:
             raise RuntimeError("pylsl is not installed; run pip install pylsl") from exception
 
@@ -357,26 +410,55 @@ class LSLSource(EEGSource):
                 f"LSL stream has {info.channel_count()} channels, "
                 f"but channel {max(self.channel_indices) + 1} was requested"
             )
+        correction = inlet.time_correction(timeout=2.0)
+        before = time.monotonic()
+        lsl_now = local_clock()
+        local_midpoint = (before + time.monotonic()) / 2
+        self._clock_offset = local_midpoint - lsl_now + correction
+        if not np.isfinite(self._clock_offset):
+            raise RuntimeError("LSL clock synchronization returned a non-finite offset")
+        # Keep one offset for the session so correction updates cannot reorder samples.
+        self._timing = StreamTimingGuard()
+        self.segment_id = 0
         self._inlet = inlet
 
     def read(self, timeout: float = 0.25) -> EEGChunk:
         if self._inlet is None:
             raise RuntimeError("Source has not been started")
-        samples, lsl_timestamps = self._inlet.pull_chunk(timeout=timeout)
-        if not samples:
-            return EEGChunk(
-                np.empty((len(self.channel_names), 0)), np.empty(0, dtype=np.float64)
-            )
-        all_channels = np.asarray(samples, dtype=np.float64).T
-        data = all_channels[list(self.channel_indices), :]
-        return EEGChunk(data, np.asarray(lsl_timestamps, dtype=np.float64))
+        if not self._pending_chunks:
+            samples, lsl_timestamps = self._inlet.pull_chunk(timeout=timeout)
+            if not samples:
+                return EEGChunk(np.empty((len(self.channel_names), 0)), np.empty(0),
+                                segment_id=self.segment_id)
+            data = np.asarray(samples, dtype=np.float64).T[list(self.channel_indices), :]
+            raw = np.asarray(lsl_timestamps, dtype=np.float64)
+            if raw.shape != (data.shape[1],):
+                raise ValueError("One LSL timestamp is required per EEG sample")
+            timestamps = raw + self._clock_offset
+            has_previous = self._timing.previous is not None
+            intervals = self._timing.check(timestamps)
+            boundaries = np.flatnonzero(intervals > self.max_sample_gap) + (not has_previous)
+            ends = [0, *boundaries.tolist(), timestamps.size]
+            for index, (start, stop) in enumerate(zip(ends, ends[1:])):
+                if start < stop:
+                    self._pending_chunks.append(EEGChunk(
+                        data[:, start:stop], timestamps[start:stop], raw[start:stop],
+                        self.segment_id + index,
+                    ))
+        chunk = self._pending_chunks.popleft()
+        self.segment_id = chunk.segment_id
+        return chunk
 
+    @defer_stop()
     def stop(self) -> None:
         self._inlet = None
+        self._pending_chunks.clear()
 
 
 class ReplaySource(EEGSource):
     """Replay a recorded NPZ through the same online code path."""
+
+    validates_timing = True
 
     def __init__(self, path: str | Path, *, realtime: bool = True, chunk_samples: int = 25):
         self.path = Path(path)
@@ -388,6 +470,7 @@ class ReplaySource(EEGSource):
         self.channel_names = ()
         self._data: np.ndarray | None = None
         self._recorded_timestamps: np.ndarray | None = None
+        self._timing: StreamTimingGuard | None = None
         self._segment_ids: np.ndarray | None = None
         self._position = 0
         self._next_emit = 0.0
@@ -404,11 +487,23 @@ class ReplaySource(EEGSource):
                 if "timestamps" in loaded.files else None
             )
             segment_ids = np.asarray(loaded["segment_ids"]) if "segment_ids" in loaded.files else None
+            lsl_max_gap = None
+            if recorded_timestamps is not None and "metadata_json" in loaded.files:
+                try:
+                    metadata = json.loads(loaded["metadata_json"].item())
+                except (ValueError, TypeError):
+                    # Legacy files can carry optional metadata unrelated to timing.
+                    metadata = None
+                if isinstance(metadata, dict):
+                    configuration = metadata.get("configuration")
+                    if isinstance(configuration, dict) and configuration.get("backend") == "lsl":
+                        lsl_max_gap = _lsl_max_sample_gap(
+                            configuration.get("lsl_max_sample_gap_seconds", LSL_MAX_GAP_SECONDS)
+                        )
         if data.ndim != 2 or data.shape[0] != len(channel_names):
             raise ValueError("Replay data must be channels x samples with matching names")
         if sample_rate <= 0 or not channel_names or len(set(channel_names)) != len(channel_names):
             raise ValueError("Replay metadata must contain a positive rate and unique channels")
-        self._data = data
         if recorded_timestamps is not None and recorded_timestamps.shape != (data.shape[1],):
             raise ValueError("Replay timestamps must match the recorded samples")
         if segment_ids is not None and (
@@ -416,9 +511,14 @@ class ReplaySource(EEGSource):
             or np.any(segment_ids < 0) or np.any(np.diff(segment_ids.astype(np.int64)) < 0)
         ):
             raise ValueError("Replay segment_ids must be non-negative increasing integers, one per sample")
+        self._data = data
         self._segment_ids = segment_ids
         self.segment_id = int(segment_ids[0]) if segment_ids is not None and segment_ids.size else 0
         self._recorded_timestamps = recorded_timestamps
+        self._timing = (
+            StreamTimingGuard(None if lsl_max_gap is not None else sample_rate, max_gap=lsl_max_gap)
+            if recorded_timestamps is not None else None
+        )
         self.sample_rate = sample_rate
         self.channel_names = channel_names
         self._position = 0
@@ -440,18 +540,23 @@ class ReplaySource(EEGSource):
         start = self._position
         stop = min(start + self.chunk_samples, self._data.shape[1])
         if self._segment_ids is not None:
-            self.segment_id = int(self._segment_ids[start])
+            segment = int(self._segment_ids[start])
+            if segment != self.segment_id and self._timing is not None:
+                self._timing.previous = None
+            self.segment_id = segment
             boundaries = np.flatnonzero(self._segment_ids[start:stop] != self.segment_id)
             if boundaries.size:
                 stop = start + int(boundaries[0])
         data = self._data[:, start:stop]
-        self._position = stop
-        self._next_emit = time.monotonic() + data.shape[1] / self.sample_rate
-        timestamps = self._stream_start + np.arange(start, stop, dtype=np.float64) / self.sample_rate
         if self._recorded_timestamps is not None:
             timestamps = self._stream_start + (
                 self._recorded_timestamps[start:stop] - self._recorded_timestamps[0]
             )
+            self._timing.check(timestamps)
+        else:
+            timestamps = self._stream_start + np.arange(start, stop, dtype=np.float64) / self.sample_rate
+        self._position = stop
+        self._next_emit = time.monotonic() + data.shape[1] / self.sample_rate
         return EEGChunk(data, timestamps, segment_id=self.segment_id)
 
     def stop(self) -> None:
@@ -466,6 +571,8 @@ class ReplaySource(EEGSource):
 
 class SyntheticSource(EEGSource):
     """Deterministic EEG-like source for UI development without a participant."""
+
+    validates_timing = True
 
     def __init__(
         self,

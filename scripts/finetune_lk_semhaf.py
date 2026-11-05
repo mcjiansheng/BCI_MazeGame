@@ -15,7 +15,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("recordings", nargs="+", type=Path, help="Chronological order; the last block is final holdout")
     parser.add_argument("--pretrained", type=Path, default=Path("outputs/pretrained/lk_semhaf16.pt"))
     parser.add_argument("--subject", required=True)
-    parser.add_argument("--holdout-session", help="Session ID reserved exclusively for final before/after evaluation")
+    holdout = parser.add_mutually_exclusive_group()
+    holdout.add_argument("--holdout-session", help="Unique session ID reserved for final before/after evaluation")
+    holdout.add_argument("--holdout-file", type=Path, help="Recording file reserved for final before/after evaluation")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--epochs", type=int, default=40)
     parser.add_argument("--patience", type=int, default=10)
@@ -32,7 +34,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     config = TrainingConfig(args.epochs, args.patience, args.batch_size, args.lr, args.weight_decay, args.seed, args.cpu_threads)
     bundle = finetune_personal(args.pretrained, args.recordings, args.subject, config,
-                              device=args.device, holdout_session=args.holdout_session)
+                              device=args.device, holdout_session=args.holdout_session, holdout_file=args.holdout_file)
     destination = save_semhaf_bundle(bundle, args.output or Path("outputs/subject_models") / args.subject / "semhaf16.pt")
     print(json.dumps({key: bundle.training_report[key] for key in (
         "data_origin", "before_finetuning", "after_finetuning", "calibration_passed", "human_mi_verified",

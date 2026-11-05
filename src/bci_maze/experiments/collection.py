@@ -3,15 +3,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
-import os
 from pathlib import Path
 import random
 import sys
-import tempfile
 import time
 
 import numpy as np
 
+from bci_maze.stopping import defer_stop
 from bci_maze.lk_mini.cli import source_from_args
 from bci_maze.lk_mini.quality import assess_signal_quality
 from bci_maze.lk_mini.recording import (
@@ -44,8 +43,11 @@ class CollectionResult:
 
 
 def make_schedule(trials_per_class: int, blocks: int, seed: int) -> list[tuple[int, str]]:
-    if (type(trials_per_class) is not int or type(blocks) is not int
-            or blocks <= 0 or trials_per_class < blocks or trials_per_class % blocks):
+    if (not isinstance(trials_per_class, (int, np.integer)) or isinstance(trials_per_class, (bool, np.bool_))
+            or not isinstance(blocks, (int, np.integer)) or isinstance(blocks, (bool, np.bool_))):
+        raise ValueError("每类试次数须为组数的正整数倍。")
+    trials_per_class, blocks = int(trials_per_class), int(blocks)
+    if blocks <= 0 or trials_per_class < blocks or trials_per_class % blocks:
         raise ValueError("每类试次数须为组数的正整数倍。")
     rng = random.Random(seed)
     schedule = []
@@ -65,13 +67,8 @@ def emit_progress(phase: str, *, label: str = "", trial_index: int = 0,
     ), ensure_ascii=False), flush=True)
 
 
-def save_mi_recording(path, *, baseline_epochs, baseline_intervals, **kwargs) -> Path:
-    """Atomically save aligned baseline/task arrays inside the stop-protected frame.
-
-    The dashboard worker defers stop signals while a function named
-    ``save_mi_recording`` remains on the main-thread stack, covering both writes
-    and the final rename without changing the original recording implementation.
-    """
+def _save_paired_recording(path, *, baseline_epochs, baseline_intervals, **kwargs) -> Path:
+    """Save paired baseline/task arrays in one atomic NPZ write."""
     path = Path(path)
     epochs = np.asarray(kwargs["epochs"])
     baseline = np.asarray(baseline_epochs)
@@ -94,51 +91,36 @@ def save_mi_recording(path, *, baseline_epochs, baseline_intervals, **kwargs) ->
                 or trial.stop_sample > continuous.shape[1] or trial.stop_sample - trial.start_sample != epochs.shape[2]
                 or trial.segment_id != segment or not np.all(ids[start:trial.stop_sample] == segment)):
             raise ValueError("基线、提示及任务区间必须完整且位于同一连接段。")
-        if (not np.array_equal(baseline[index], continuous[:, start:stop], equal_nan=True)
-                or not np.array_equal(epochs[index], continuous[:, trial.start_sample:trial.stop_sample], equal_nan=True)):
-            raise ValueError("基线及任务数组须与保存的连续信号区间一致。")
     configuration = dict(kwargs["configuration"])
     configuration.update(baseline_protocol=dict(BASELINE_PROTOCOL),
                          baseline_intervals=[dict(item) for item in baseline_intervals],
                          baseline_seconds=BASELINE_SECONDS, cue_seconds=CUE_SECONDS,
                          active_seconds=ACTIVE_SECONDS)
-    kwargs = dict(kwargs, configuration=configuration)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.stem}-", suffix=".npz", dir=path.parent)
-    os.close(descriptor)
-    temporary = Path(temporary)
-    try:
-        _save_standard_recording(temporary, **kwargs)
-        with np.load(temporary, allow_pickle=False) as saved:
-            arrays = {key: saved[key].copy() for key in saved.files}
-        summary = configuration.get("collection_summary")
-        if summary:
-            metadata = json.loads(str(arrays["metadata_json"].item()))
-            metadata["trial_summary"].update(
-                planned=summary["target_trials"], completed=summary["complete_trials"],
-                usable=summary["usable_trials"], artifact_marked=summary["artifact_trials"],
-                nonfinite=summary["nonfinite_trials"], excluded_complete=summary["excluded_complete_trials"],
-                discarded=summary["incomplete_trials"], unattempted=summary["unattempted_trials"],
-                attempts=summary["total_attempts"], retries=summary["retry_count"], unfilled=summary["unfilled_trials"],
-                planned_definition="planned slots; each slot targets one usable trial",
-                completed_definition="complete recorded attempts including artifact-marked and nonfinite trials",
-                usable_definition="complete attempts passing operator-artifact and finite-value checks",
-                unattempted_definition="planned slots with no attempt started",
-                unfilled_definition="planned slots without a usable completed attempt",
-            )
-            arrays["metadata_json"] = np.asarray(json.dumps(metadata, ensure_ascii=False))
-        arrays.update(
+    summary = configuration.get("collection_summary")
+    summary_override = None
+    if summary:
+        summary_override = dict(
+            planned=summary["target_trials"], completed=summary["complete_trials"],
+            usable=summary["usable_trials"], artifact_marked=summary["artifact_trials"],
+            nonfinite=summary["nonfinite_trials"], excluded_complete=summary["excluded_complete_trials"],
+            discarded=summary["incomplete_trials"], unattempted=summary["unattempted_trials"],
+            attempts=summary["total_attempts"], retries=summary["retry_count"], unfilled=summary["unfilled_trials"],
+            planned_definition="planned slots; each slot targets one usable trial",
+            completed_definition="complete recorded attempts including artifact-marked and nonfinite trials",
+            usable_definition="complete attempts passing operator-artifact and finite-value checks",
+            unattempted_definition="planned slots with no attempt started",
+            unfilled_definition="planned slots without a usable completed attempt",
+        )
+    return _save_standard_recording(
+        path, **dict(kwargs, configuration=configuration),
+        trial_summary_override=summary_override,
+        extra_arrays=dict(
             baseline_epochs=baseline.astype(np.float32),
             baseline_start_samples=np.asarray([item["start_sample"] for item in baseline_intervals], dtype=np.int64),
             baseline_stop_samples=np.asarray([item["stop_sample"] for item in baseline_intervals], dtype=np.int64),
             baseline_segment_ids=np.asarray([item["segment_id"] for item in baseline_intervals], dtype=np.int64),
-        )
-        np.savez_compressed(temporary, **arrays)
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
-    return path
-
+        ),
+    )
 
 def extract_trial_pair(recorder, baseline_cursor: tuple[int, int],
                        active_cursor: tuple[int, int], sample_rate: int):
@@ -276,55 +258,54 @@ def collect_experiment(args, *, source_factory=None, recorder_factory=None,
             raise ValueError("incomplete_window")
         recorder.segment(start, stop, segment_id=segment)
 
+    @defer_stop()
     def begin_attempt(attempt_id, baseline_cursor):
-        def finish():
-            nonlocal pending
-            pending = dict(trial_index=attempt_id, attempt_index=attempt_id, planned_slot=slot_index,
-                           retry_index=retry_index, block=block, label=label, status="running",
-                           started_at=time.time(), started_monotonic=time.monotonic(), phase_timings=[],
-                           baseline_start_sample=baseline_cursor[0], segment_id=baseline_cursor[1],
-                           baseline_stop_sample=baseline_cursor[0] + round(rate * BASELINE_SECONDS))
-            attempts.append(pending)
-        return finish()
+        nonlocal pending
+        pending = dict(trial_index=attempt_id, attempt_index=attempt_id, planned_slot=slot_index,
+                       retry_index=retry_index, block=block, label=label, status="running",
+                       started_at=time.time(), started_monotonic=time.monotonic(), phase_timings=[],
+                       baseline_start_sample=baseline_cursor[0], segment_id=baseline_cursor[1],
+                       baseline_stop_sample=baseline_cursor[0] + round(rate * BASELINE_SECONDS))
+        attempts.append(pending)
 
+    @defer_stop()
     def end_attempt(status, reason="", detail=""):
-        def finish():
-            # Keep state transition, rejection bookkeeping and pending cleanup
-            # indivisible with respect to the dashboard's cooperative stop.
-            nonlocal pending
-            pending.update(status=status, reason=reason, detail=detail, ended_at=time.time(),
-                           ended_monotonic=time.monotonic(), end_sample_count=recorder.sample_count,
-                           end_segment_id=recorder.segment_id, recovering_at_end=bool(recorder.recovering))
-            for phase in ("baseline", "active"):
-                target = pending.get(phase + "_stop_sample")
-                if target is not None:
-                    pending[phase + "_missing_samples"] = max(0, target - recorder.sample_count)
-            if status == "discarded":
-                discarded.append(dict(pending))
-            pending = None
-        return finish()
+        # Keep state transition, rejection bookkeeping and pending cleanup
+        # indivisible with respect to the dashboard's cooperative stop.
+        nonlocal pending
+        pending.update(status=status, reason=reason, detail=detail, ended_at=time.time(),
+                       ended_monotonic=time.monotonic(), end_sample_count=recorder.sample_count,
+                       end_segment_id=recorder.segment_id, recovering_at_end=bool(recorder.recovering))
+        for phase in ("baseline", "active"):
+            target = pending.get(phase + "_stop_sample")
+            if target is not None:
+                pending[phase + "_missing_samples"] = max(0, target - recorder.sample_count)
+        if status == "discarded":
+            discarded.append(dict(pending))
+        pending = None
 
+    @defer_stop()
     def commit_trial(attempt_id, active_cursor, baseline, epoch, interval):
-        def finish():
-            """Commit aligned arrays, usable count and attempt status together."""
-            nonlocal retained
-            artifact = bool(display.consume_artifact())
-            finite = bool(np.isfinite(epoch).all() and np.isfinite(baseline).all())
-            trials.append(TrialRecord(attempt_id, block, label, active_cursor[0], pending["active_stop_sample"],
-                                      pending["cue_monotonic"], artifact, active_cursor[1]))
-            epochs.append(epoch)
-            baselines.append(baseline)
-            intervals.append(dict(interval, trial_index=attempt_id, planned_slot=slot_index))
-            accepted = not artifact and finite
-            if accepted:
-                retained += 1
-            pending.update(artifact=artifact, finite=finite, stored_trial_index=len(trials) - 1)
-            end_attempt("retained" if accepted else "excluded",
-                        "" if accepted else "manual_artifact_and_nonfinite" if artifact and not finite
-                        else "manual_artifact" if artifact else "nonfinite")
-            return accepted
-        return finish()
+        """Commit aligned arrays, usable count and attempt status together."""
+        nonlocal retained
+        artifact = bool(display.consume_artifact())
+        finite = bool(np.isfinite(epoch).all() and np.isfinite(baseline).all())
+        trials.append(TrialRecord(attempt_id, block, label, active_cursor[0], pending["active_stop_sample"],
+                                  pending["cue_monotonic"], artifact, active_cursor[1]))
+        epochs.append(epoch)
+        baselines.append(baseline)
+        intervals.append(dict(interval, trial_index=attempt_id, planned_slot=slot_index))
+        accepted = not artifact and finite
+        if accepted:
+            retained += 1
+        pending.update(artifact=artifact, finite=finite, stored_trial_index=len(trials) - 1)
+        end_attempt("retained" if accepted else "excluded",
+                    "" if accepted else "manual_artifact_and_nonfinite" if artifact and not finite
+                    else "manual_artifact" if artifact else "nonfinite")
+        return accepted
 
+
+    @defer_stop()
     def finish():
         """Protect cleanup, all snapshots, array assembly and atomic persistence."""
         nonlocal pending, display_closed
@@ -351,13 +332,14 @@ def collect_experiment(args, *, source_factory=None, recorder_factory=None,
                        max_duration_seconds=duration_limit, freshness_limit_seconds=.5, last_planned_slot=slot_index,
                        last_retry_index=retry_index,
                        raw_samples=int(continuous.shape[1]), raw_seconds=continuous.shape[1] / rate)
-        path = save_mi_recording(
+        path = _save_paired_recording(
             args.recording_output, continuous=continuous, timestamps=timestamps,
             epochs=np.stack(epochs) if epochs else np.empty((0, len(names), round(rate * ACTIVE_SECONDS))),
             baseline_epochs=np.stack(baselines) if baselines else np.empty((0, len(names), round(rate * BASELINE_SECONDS))),
             baseline_intervals=intervals, labels=[trial.label for trial in trials], trials=trials, sample_rate=rate,
             channel_names=names, subject_id=args.subject, session_id=args.session,
             segment_ids=recorder.snapshot_segment_ids(), discarded_trials=discarded,
+            received_timestamps=recorder.snapshot_received_timestamps(),
             recovery_stats=dict(source.recovery_stats), recovery_events=list(source.recovery_events),
             configuration=dict(task=task, backend=args.backend, label_source="visual_cue",
                                planned_trials=len(schedule), blocks=args.blocks, seed=args.seed,
@@ -368,9 +350,10 @@ def collect_experiment(args, *, source_factory=None, recorder_factory=None,
                                reference="SRB2" if args.backend == "brainflow" else "unspecified",
                                bias="BIAS" if args.backend == "brainflow" else "unspecified",
                                gain=getattr(args, "gain", 24) if args.backend == "brainflow" else None,
+                               lsl_max_sample_gap_seconds=getattr(source, "max_sample_gap", None),
                                timing_basis="continuous_recorder_sample_indices_at_phase_request",
                                timestamp_basis={"brainflow": "nominal_rate_reconstruction_per_connection_segment",
-                                                "lsl": "lsl_stream_timestamps", "synthetic": "synthetic_nominal_sample_clock"}[args.backend]),
+                                                "lsl": "lsl_corrected_to_local_monotonic", "synthetic": "synthetic_nominal_sample_clock"}[args.backend]),
         )
         emit_progress("complete", trial_index=slot_index, total_trials=len(schedule), block=block,
                       text=f"已保存 {retained}/{len(schedule)} 次有效记录及全部已收到的连续信号。", **counters())
@@ -422,12 +405,12 @@ def collect_experiment(args, *, source_factory=None, recorder_factory=None,
                                 interrupted = True
                                 break
                             wait_window(active_cursor[0], pending["active_stop_sample"], active_cursor[1])
-                            baseline, epoch, interval = extract_trial_pair(recorder, baseline_cursor, active_cursor, rate)
+                            with defer_stop():
+                                baseline, epoch, interval = extract_trial_pair(recorder, baseline_cursor, active_cursor, rate)
+                                accepted = commit_trial(attempt_id, active_cursor, baseline, epoch, interval)
                         except ValueError as exception:
                             end_attempt("discarded", str(exception))
                             print(f"计划第 {slot_index + 1} 次，尝试 {retry_index + 1} 未完成：{exception}", flush=True)
-                        else:
-                            accepted = commit_trial(attempt_id, active_cursor, baseline, epoch, interval)
                         if not show("rest", "休息", "+", "停止任务，放松双手，可自然眨眼。", rng.uniform(2, 3)):
                             interrupted = True
                             break
@@ -440,12 +423,9 @@ def collect_experiment(args, *, source_factory=None, recorder_factory=None,
         except Exception as exception:
             error = f"{type(exception).__name__}: {exception}"
             stop_reason = str(exception) if isinstance(exception, TimeoutError) else "capture_error"
-        return finish()
-    except KeyboardInterrupt:
-        # One retry handles a late stop at finalization entry; further direct
-        # interrupts still propagate. Dashboard stop is delivered only once.
-        interrupted = True
-        return finish()
+    finally:
+        result = finish()
+    return result
 
 
 def create_demo_recording(path, *, experiment: str, subject: str, session: str,
@@ -489,7 +469,7 @@ def create_demo_recording(path, *, experiment: str, subject: str, session: str,
         trials.append(TrialRecord(index, block, label, start, start + counts[2], start / sample_rate))
         position += count
     continuous = np.concatenate(parts, axis=1)
-    return save_mi_recording(
+    return _save_paired_recording(
         path, continuous=continuous, timestamps=np.arange(position) / sample_rate,
         epochs=np.stack(epochs), baseline_epochs=np.stack(baselines), baseline_intervals=intervals,
         labels=[trial.label for trial in trials], trials=trials, sample_rate=sample_rate,

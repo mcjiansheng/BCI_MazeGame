@@ -186,17 +186,31 @@ def test_complete_and_cleanup_preserve_manual_pause_and_release_owned_pause():
     assert control.step(True).phase == "complete"
 
 
-@pytest.mark.parametrize("provenance", [{}, {"data_origin": "public"}, {"data_origin": "synthetic"}, {"data_origin": "hardware_recorded", "calibration_passed": False}])
+@pytest.mark.parametrize("provenance", [{}, {"data_origin": "public"}, {"data_origin": "synthetic", "calibration_passed": True}])
 def test_unverified_models_need_explicit_control_override(provenance):
     bundle = SimpleNamespace(provenance=provenance)
-    with pytest.raises(ValueError, match="passed calibration"):
+    with pytest.raises(ValueError, match="recorded EEG"):
         model_control_provenance(bundle)
-    assert model_control_provenance(bundle, allow_unvalidated=True)["unvalidated_control_override"]
+    control = model_control_provenance(bundle, allow_unvalidated=True)
+    assert control["unvalidated_control_override"]
+    assert not control["control_validated"]
+    assert control["calibration_passed"] is provenance.get("calibration_passed", False)
 
 
-def test_verified_human_calibration_allows_control():
-    bundle = SimpleNamespace(provenance=dict(data_origin="hardware_recorded", calibration_passed=True, human_mi_verified=False))
-    assert model_control_provenance(bundle)["control_validated"]
+@pytest.mark.parametrize("origin", ["hardware_recorded", "lsl_recorded"])
+@pytest.mark.parametrize("passed", [True, False])
+def test_recorded_imagery_can_control_with_actual_calibration_result(origin, passed):
+    bundle = SimpleNamespace(provenance=dict(data_origin=origin, calibration_passed=passed))
+    control = model_control_provenance(bundle)
+    assert control["calibration_passed"] is passed
+    assert control["control_validated"] is passed
+    assert not control["unvalidated_control_override"]
+
+
+def test_motor_execution_is_not_a_game_control_task():
+    bundle = SimpleNamespace(provenance=dict(data_origin="hardware_recorded", task="motor_execution"))
+    with pytest.raises(ValueError, match="motor-imagery model"):
+        model_control_provenance(bundle, allow_unvalidated=True)
 
 
 @pytest.fixture

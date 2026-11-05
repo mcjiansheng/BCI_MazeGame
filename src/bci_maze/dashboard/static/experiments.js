@@ -7,7 +7,7 @@
   const settings={
     motor:{title:"真实左右握拳对照",description:"按提示完成真实左右握拳，记录动作任务与静息基线。任务标签记录为真实动作，与想象记录分开分析。"},
     imagery:{title:"运动想象信号分析",description:"按提示想象左右手动作，并记录静息基线。分析事件相关时频变化（ERSP）、中央区 μ / β 功率变化、头皮分布及带符号 r² 效应。"},
-    benchmark:{title:"CSP + LDA 基线模型验证",description:"空间滤波提取两类运动想象特征，以线性判别模型分类。按会话或采集分组独立评价，并通过标签置乱建立比较分布。"}
+    benchmark:{title:"CSP + LDA 基线模型验证",description:"空间滤波提取两类运动想象特征，以线性判别模型分类。按采集文件或采集分组独立评价，并通过标签置乱建立比较分布。"}
   };
   const classNames={left_hand:"左手",right_hand:"右手",feet:"双脚",tongue:"舌头"};
   const phaseNames={baseline:"静息基线",cue:"动作提示",active:"任务进行中",rest:"休息",waiting:"等待数据",complete:"采集完成"};
@@ -196,7 +196,7 @@
     if(!available)return;
     const metrics=$("experiment-benchmark-metrics"),permutation=benchmark.permutation||{};metrics.replaceChildren();
     metric(metrics,"平衡准确率 BA",percent(benchmark.balanced_accuracy),"左右两类召回率的平均值");metric(metrics,"二分类参考","50.0%","二分类 BA 的参考水平");metric(metrics,"标签置乱均值",percent(permutation.null_mean),`${number(permutation.n,0)} 次标签置乱`);metric(metrics,"经验 p 值",number(permutation.p_value,4),"按报告的置乱协议计算");
-    const splitNames={session:"按会话划分",block:"按采集分组划分",leave_one_session_out:"留一会话",leave_one_block_out:"留一采集分组",leave_one_group_out:"留一分组"};
+    const splitNames={session:"按采集文件划分",block:"按采集分组划分",leave_one_session_out:"留一会话",leave_one_run_out:"留一采集文件",leave_one_block_out:"留一采集分组",leave_one_group_out:"留一分组"};
     text("experiment-split-summary",`${splitNames[benchmark.split_method]||benchmark.split_method||"分组评价"} · ${number(benchmark.n_groups,0)} 组 · ${number(benchmark.n_splits,0)} 折 · 总准确率 ${percent(benchmark.accuracy)}`);
     const folds=$("experiment-folds");folds.replaceChildren();
     (benchmark.folds||[]).forEach((fold,index)=>{const row=node("tr");[fold.fold??index+1,(fold.train_groups||[]).join("、"),(fold.test_groups||[]).join("、"),percent(fold.balanced_accuracy)].forEach((value)=>row.append(node("td",value||"—")));row.title=`训练 ${fold.n_train??"—"} / 测试 ${fold.n_test??"—"} 个试次`;folds.append(row);});

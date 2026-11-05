@@ -10,6 +10,8 @@ import time
 from typing import Callable
 import uuid
 
+from bci_maze.stopping import defer_stop
+
 
 def validated_navigation(value: object) -> dict[str, object]:
     if not isinstance(value, dict) or value.get("mode") != "first_person_relative":
@@ -309,6 +311,7 @@ class GameControlWorker:
             with self._lock:
                 self._events.extend(self.controller.events)
 
+    @defer_stop()
     def close(self) -> None:
         self._stop.set()
         if self._thread is not None:
@@ -319,10 +322,18 @@ class GameControlWorker:
 
 def model_control_provenance(bundle: object, *, allow_unvalidated: bool = False) -> dict[str, object]:
     provenance = dict(getattr(bundle, "provenance", {}) or {})
-    validated = (
-        provenance.get("data_origin") in {"hardware_recorded", "lsl_recorded"}
-        and provenance.get("calibration_passed") is True
-    )
-    if not validated and not allow_unvalidated:
-        raise ValueError("Unity control requires recorded EEG with passed calibration; use --allow-unvalidated-control for an explicit software validation run")
-    return {**provenance, "control_validated": validated, "unvalidated_control_override": bool(allow_unvalidated and not validated)}
+    if provenance.get("task", "motor_imagery") != "motor_imagery":
+        raise ValueError("Unity motor-imagery control requires a motor-imagery model")
+    recorded = provenance.get("data_origin") in {"hardware_recorded", "lsl_recorded"}
+    calibration_passed = provenance.get("calibration_passed") is True
+    if not recorded and not allow_unvalidated:
+        raise ValueError(
+            "Unity control requires a personal model trained on recorded EEG; "
+            "use --allow-unvalidated-control for a software validation run"
+        )
+    return {
+        **provenance,
+        "calibration_passed": calibration_passed,
+        "control_validated": recorded and calibration_passed,
+        "unvalidated_control_override": not recorded and allow_unvalidated,
+    }

@@ -10,6 +10,7 @@ import numpy as np
 from scipy.integrate import trapezoid
 from scipy.signal import spectrogram, welch
 
+from ..lk_mini.provenance import recording_source, recording_task
 from .benchmark import CLASSES, grouped_benchmark
 
 
@@ -32,7 +33,7 @@ class Recordings:
     epochs: np.ndarray
     baseline_epochs: np.ndarray | None
     labels: np.ndarray
-    sessions: np.ndarray
+    runs: np.ndarray  # Trial-wise labels that identify one acquisition file each.
     blocks: np.ndarray
     sample_rate: int
     channels: tuple[str, ...]
@@ -44,21 +45,6 @@ class Recordings:
     trial_origins: list[dict]
 
 
-def _source_kind(metadata: dict) -> str:
-    provenance = metadata.get("provenance", {})
-    configuration = metadata.get("configuration", {})
-    values = [str(value) for value in (provenance.get("source_kind"), provenance.get("kind"),
-                                      metadata.get("source_kind")) if value]
-    backend = configuration.get("backend", provenance.get("backend"))
-    inferred = {"brainflow": "hardware", "lsl": "lsl", "replay": "replay",
-                "synthetic": "synthetic", "synthetic_mi": "synthetic"}.get(backend)
-    if inferred:
-        values.append(inferred)
-    if len(set(values)) > 1:
-        raise ValueError("记录中的数据来源字段相互冲突。")
-    return values[0] if values else "unspecified"
-
-
 def load_recordings(paths: list[Path]) -> Recordings:
     """Validate identity and EEG arrays while preserving original group membership."""
     if not paths:
@@ -66,12 +52,12 @@ def load_recordings(paths: list[Path]) -> Recordings:
     resolved = [Path(path).resolve() for path in paths]
     if len(set(resolved)) != len(resolved):
         raise ValueError("同一采集记录被重复选择。")
-    arrays, baselines, labels_all, sessions_all, blocks_all = [], [], [], [], []
+    arrays, baselines, labels_all, runs_all, blocks_all = [], [], [], [], []
     inputs, origins = [], []
     expected = None
     exclusions = dict(total_input_trials=0, artifact_marked=0, nonfinite_after_artifact=0,
                       total_excluded=0, missing_baseline_trials=0)
-    for path in resolved:
+    for run_number, path in enumerate(resolved, 1):
         with np.load(path, allow_pickle=False) as saved:
             required = {"epochs", "labels", "blocks", "artifact", "channel_names", "sample_rate", "metadata_json"}
             if not required.issubset(saved.files):
@@ -79,13 +65,16 @@ def load_recordings(paths: list[Path]) -> Recordings:
             metadata = json.loads(str(saved["metadata_json"].item()))
             if not isinstance(metadata, dict) or not isinstance(metadata.get("configuration", {}), dict) or not isinstance(metadata.get("provenance", {}), dict):
                 raise ValueError(f"{path.name} 元数据格式错误。")
-            subject, session = str(metadata.get("subject_id", "")).strip(), str(metadata.get("session_id", "")).strip()
+            subject, session = str(metadata.get("subject_id") or "").strip(), str(metadata.get("session_id") or "").strip()
             if not subject or not session:
                 raise ValueError(f"{path.name} 需要明确的受试者编号和会话编号。")
-            task = str(metadata.get("configuration", {}).get("task", metadata.get("task", "unspecified")))
+            try:
+                task = recording_task(metadata)
+                source_kind = recording_source(metadata)
+            except ValueError as error:
+                raise ValueError(f"{path.name}: {error}") from error
             if task not in {"motor_execution", "motor_imagery", "unspecified"}:
                 raise ValueError(f"{path.name} 任务类型须为 motor_execution 或 motor_imagery。")
-            source_kind = _source_kind(metadata)
             rate_value = saved["sample_rate"].item()
             if not np.isfinite(rate_value) or float(rate_value) != int(rate_value) or rate_value <= 80:
                 raise ValueError("分析 4–40 Hz 频谱需要高于 80 Hz 的整数采样率。")
@@ -138,9 +127,10 @@ def load_recordings(paths: list[Path]) -> Recordings:
             arrays.append(epochs[keep])
             baselines.append(baseline[keep] if baseline is not None else None)
             labels_all.append(labels[keep])
-            sessions_all.append(np.repeat(session, int(keep.sum())))
+            run = f"{session}（采集 {run_number}）"
+            runs_all.append(np.repeat(run, int(keep.sum())))
             blocks_all.append(blocks[keep])
-            inputs.append(dict(file=str(path), session=session, n_trials=n, retained_trials=int(keep.sum()),
+            inputs.append(dict(file=str(path), session=session, run=run, n_trials=n, retained_trials=int(keep.sum()),
                                artifact_marked=int(artifact.sum()),
                                nonfinite_after_artifact=int(np.count_nonzero(~artifact & ~finite)),
                                total_excluded=int(np.count_nonzero(~keep)),
@@ -154,7 +144,7 @@ def load_recordings(paths: list[Path]) -> Recordings:
         # Preserve the input baseline shape and availability for an empty report.
         retained_baselines = baselines
     baseline = np.concatenate(retained_baselines) if all(value is not None for value in retained_baselines) else None
-    return Recordings(epochs, baseline, np.concatenate(labels_all), np.concatenate(sessions_all),
+    return Recordings(epochs, baseline, np.concatenate(labels_all), np.concatenate(runs_all),
                       np.concatenate(blocks_all), expected[2], expected[1], expected[0], expected[3],
                       expected[4], exclusions, inputs, origins)
 
@@ -317,22 +307,22 @@ def analyze_recordings(paths: list[Path], output_dir: Path, *, run_benchmark: bo
                                         source_urls=[METHOD_SOURCES["signed_r2"]]),
                       "topomap": dict(description="采用 standard_1020 模板中本项目电极的二维俯视投影；线性插值限定在已测电极凸包内，点标出电极位置。活动图为逐试次频带对数功率均值。",
                                       source_urls=[METHOD_SOURCES["montage"]]),
-                      "benchmark": dict(description="CSP + 收缩 LDA 使用 7–30 Hz EEG。按完整会话或实验组留一组评估，每折重新拟合空间滤波与分类器。置乱标签限定在组内，每次按同一分组重新训练全部折；统计量为汇总测试预测的平衡准确率，二分类基准为 50%。",
+                      "benchmark": dict(description="CSP + 收缩 LDA 使用 7–30 Hz EEG。按完整采集文件或文件内的实验组留一组评估，每折重新拟合空间滤波与分类器。置乱标签限定在组内，每次按同一分组重新训练全部折；统计量为汇总测试预测的平衡准确率，二分类基准为 50%。",
                                         source_urls=[METHOD_SOURCES["groups"], METHOD_SOURCES["permutation"]]),
                   })
     if no_usable_trials:
         result.update(status="no_usable_trials", message=empty_reason,
                       benchmark=dict(status="unavailable", reason=empty_reason, requested_split=split,
-                                     n_sessions=0, n_session_blocks=0))
+                                     n_runs=0, n_run_blocks=0))
         notes.append(empty_reason)
     elif run_benchmark:
         try:
-            result["benchmark"] = grouped_benchmark(recording.epochs, recording.labels, recording.sessions,
+            result["benchmark"] = grouped_benchmark(recording.epochs, recording.labels, recording.runs,
                 recording.blocks, recording.sample_rate, permutations=permutations, seed=seed, split=split)
         except ValueError as error:
             result["benchmark"] = dict(status="unavailable", reason=str(error), requested_split=split,
-                n_sessions=int(np.unique(recording.sessions).size),
-                n_session_blocks=len(set(zip(recording.sessions.tolist(), recording.blocks.tolist()))))
+                n_runs=int(np.unique(recording.runs).size),
+                n_run_blocks=len(set(zip(recording.runs.tolist(), recording.blocks.tolist()))))
             notes.append("分组基准待完成：" + str(error))
     directory = Path(output_dir)
     directory.mkdir(parents=True, exist_ok=True)

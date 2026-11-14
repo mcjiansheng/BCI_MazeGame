@@ -1,5 +1,7 @@
 # 本机 MI 程序运行说明
 
+新电脑安装请使用[从 GitHub 克隆到设备采集的完整指南](FRESH_PC_SETUP.md)。下文记录现有工作站的环境路径和历史测试。
+
 项目路径：`D:\xht\BCI-Maze game`。
 
 SE-MHAF 十六通道公开预训练模型已保存在本机。短轮采集默认左右手各 10 次，提示流程约 3 分 45 秒；个人微调与 Unity 路口控制使用 [SE-MHAF 真机流程](SE_MHAF_LIVE.md)。下文 `train` 与 `.joblib` 命令保留为 CSP＋LDA 对照入口；启动器会为 SE-MHAF 自动选择 `.venv` 中的 PyTorch 环境。
@@ -72,10 +74,12 @@ BrainFlow 入口默认启用自动重连。连续 3 秒没有有效样本，或�
 本机已完成这一步。如日后删除环境，可在项目根目录运行：
 
 ```powershell
-& 'C:\Users\48811\anaconda3\python.exe' -m venv .venv-mi
+py -3.11 -m venv .venv-mi
 .\.venv-mi\Scripts\python.exe -m pip install -r requirements-mi.txt
 .\.venv-mi\Scripts\python.exe -m pip check
 ```
+
+使用 Python 3.12 时，将 `py -3.11` 换为 `py -3.12`；也可使用已安装的 Python 完整路径创建环境。
 
 独立环境的 MI 回归测试：
 

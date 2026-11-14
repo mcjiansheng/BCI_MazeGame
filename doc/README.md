@@ -6,6 +6,8 @@
 
 ## 当前实现与实验文档
 
+- [新电脑安装与设备采集](FRESH_PC_SETUP.md)：GitHub 克隆、Python 采集环境、厂商配套软件与 USB 驱动获取、STA/AP 设备连接、网页采集和记录复核。
+
 - [SE-MHAF 十六通道真机流程](SE_MHAF_LIVE.md)：公开预训练、短轮采集、个人微调、路口控制、自动恢复与验证结果。
 - [本机 MI 运行说明](LOCAL_MI_SETUP.md)：独立环境、Windows 启动入口、core-8 保持不变的十六路接线和本机硬件诊断状态。
 - [MI 代码审查记录](MI_CODE_REVIEW.md)：已修复问题、回归验证与尚需实际实验验证的限制。

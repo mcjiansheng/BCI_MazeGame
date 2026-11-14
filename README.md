@@ -34,6 +34,8 @@
 
 ## 快速开始
 
+连接 LK-Mini-EEG16 并使用网页采集，请按[新电脑安装与设备采集指南](doc/FRESH_PC_SETUP.md)配置 `.venv-mi`。下面的 `.venv` 安装与公开数据集步骤用于模型研究。
+
 ### 1. 安装 Python 依赖
 
 项目要求 Python 3.10 或更高版本。PyTorch 请先按本机 CUDA / CPU 环境从官方渠道安装，再安装其余依赖；requirements.txt 有意没有固定 torch，以免覆盖正确的 CUDA 构建。
@@ -158,6 +160,8 @@ python scripts/run_bci_maze_integration.py --host 127.0.0.1 --port 7777
 无 EEG 设备时，在 Unity Play 模式运行 `uv run scripts/validate_unity_maze.py`，可复核导航回归和真实 UDP 通关；详见 [3D 迷宫流程与验收](doc/UNITY_FIRST_PERSON_DEMO.md)。
 
 ## LK-Mini-EEG16 真实设备与受试者 MI
+
+**新电脑从这里开始：[安装环境、取得配套驱动、连接设备并完成采集](doc/FRESH_PC_SETUP.md)。** 采集使用 `.venv-mi`；厂商 USB 路由器驱动、使用说明书和 OpenBCI GUI 安装包需从设备配套资料包取得。指南分别列出 GitHub 已包含的文件与厂商资料清单，并提供 STA/AP 连接和网页保存步骤。
 
 本地可视化控制台：双击根目录的 `bci-dashboard.cmd`，或运行 `bci-mi.cmd ui`。在浏览器中集中配置数据源、查看十六路波形与信号质量、启动采集和模型任务，并查询及控制 Unity 迷宫。操作流程、质量指标和电极接触检测的实现状态见 [实验控制台说明](doc/CONTROL_CONSOLE.md)。
 

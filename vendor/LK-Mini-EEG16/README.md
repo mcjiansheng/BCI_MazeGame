@@ -4,6 +4,8 @@
 
 ## 文件
 
+新电脑安装、USB 接收器驱动与上位机软件获取见[安装与设备连接指南](../../doc/FRESH_PC_SETUP.md)。本目录提供通信协议和开发示例；厂商使用说明书、`SR9900_SFX.EXE` 驱动及 OpenBCI GUI 安装包从设备配套资料包取得。
+
 - `LK-Mini-EEG16-通信协议-20260814.pdf`：Cyton+Daisy 兼容协议、采样率、通道、阻抗、流控制和 33 字节数据帧说明。
 - `LK-Mini-EEG16-Python.rar`：厂商 BrainFlow/PyQt 示例原件。
 - `BrainFlow官方开发文档说明.txt`：厂商附带的 BrainFlow 文档入口。

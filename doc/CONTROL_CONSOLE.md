@@ -6,6 +6,8 @@
 
 ## 启动与操作流程
 
+新电脑先按[安装与设备连接指南](FRESH_PC_SETUP.md)安装 `.venv-mi`、配套 USB 接收器驱动并配置设备网络。该指南列出 GitHub 文件与另行取得的厂商资料，以及第一次采集和文件检查步骤。
+
 在仓库根目录双击 `bci-dashboard.cmd`，或运行：
 
 ```powershell

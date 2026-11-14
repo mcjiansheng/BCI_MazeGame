@@ -2,7 +2,7 @@
 
 当前设备配置为 16 通道。SE-MHAF 公开预训练、短轮采集、个人微调及 Unity 控制见 [SE-MHAF 真机流程](SE_MHAF_LIVE.md)。本手册保留接线、实验操作和 CSP＋LDA 对照方法。
 
-本机已配置独立的 `.venv-mi` 环境，直接使用项目根目录的 `bci-mi.cmd` 运行。入口和实测结果见 [本机运行说明](LOCAL_MI_SETUP.md)。下面安装段用于其他电脑；本机不必重新安装原来的 `.venv`。
+新电脑先按[安装、配套驱动与设备连接指南](FRESH_PC_SETUP.md)完成环境和设备配置。本机已有独立的 `.venv-mi` 环境，入口和实测结果见[本机运行说明](LOCAL_MI_SETUP.md)。
 
 适用对象：第一次接触 EEG/脑机接口设备的小组成员
 
@@ -50,17 +50,19 @@
 
 ### 3.2 安装 Python 环境
 
-在 PowerShell 中进入仓库根目录：
+完整的 Git/Python 下载、配套驱动获取与克隆步骤见[新电脑指南](FRESH_PC_SETUP.md)。已克隆项目并安装 Python 后，在 PowerShell 中进入仓库根目录：
 
 ```powershell
-py -3.11 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-pip install -r requirements.txt
-pip install -e . --no-deps
+py -3.11 -m venv .venv-mi
+.\.venv-mi\Scripts\python.exe -m pip install --upgrade pip
+.\.venv-mi\Scripts\python.exe -m pip install -r requirements-mi.txt
+.\.venv-mi\Scripts\python.exe -m pip check
+.\bci-mi.cmd ui
 ```
 
-如果 PowerShell 禁止执行 `Activate.ps1`，不需要修改系统执行策略：直接用 `.\.venv\Scripts\python.exe -m pip ...` 安装，并把后续命令中的 `python` 换为 `.\.venv\Scripts\python.exe`。若没有 `py`，先安装 Python 3.11，并在安装时勾选 Tcl/Tk 支持；可运行 `python -m tkinter` 验证提示窗口组件。
+Python 3.12 对应使用 `py -3.12`。安装时保留 Tcl/Tk 支持，可运行 `.\.venv-mi\Scripts\python.exe -m tkinter` 验证提示窗口组件。采集启动器固定使用 `.venv-mi`，并自动设置源码路径。
+
+手册后续的 `python scripts/...` 为脚本调用形式；在这个环境中运行时，把 `python` 替换为 `.\.venv-mi\Scripts\python.exe`，并先在当前 PowerShell 设置 `$env:PYTHONPATH = (Join-Path (Get-Location) 'src')`。网页和 `bci-mi.cmd` 入口已处理源码路径。
 
 说明：
 
@@ -68,13 +70,13 @@ pip install -e . --no-deps
 - `pylsl`：接收 OpenBCI GUI 转发的 LSL 数据；
 - `numpy/scipy/scikit-learn`：预处理与 CSP+LDA；
 - `matplotlib`：实时波形和概率显示；
-- `-e .`：让 `scripts/` 能导入 `src/bci_maze`。
+- `bci-mi.cmd`：为对应任务设置解释器及 `src/bci_maze` 源码路径。
 
 验证安装：
 
 ```powershell
-python -c "from brainflow.board_shim import BoardIds; print(BoardIds.CYTON_DAISY_WIFI_BOARD)"
-python -c "import pylsl, numpy, scipy, sklearn; print('dependencies ok')"
+.\.venv-mi\Scripts\python.exe -c "from brainflow.board_shim import BoardShim, BoardIds; print(BoardShim.get_eeg_channels(BoardIds.CYTON_DAISY_WIFI_BOARD.value))"
+.\.venv-mi\Scripts\python.exe -c "import pylsl, numpy, scipy, sklearn; print('LSL:', pylsl.library_version()); print('dependencies ok')"
 ```
 
 ## 4. 电极位置与接线
@@ -165,7 +167,7 @@ python -c "import pylsl, numpy, scipy, sklearn; print('dependencies ok')"
 
 本机使用厂商 USB 路由器的 STA 方式。依据 `LK-Mini-EEG16/LK-Mini-EEG16 使用说明书 20260716.pdf` 第 7 页：
 
-1. 插入厂商 USB 接收器；Windows 设备名为 `Corechip SR9900 USB2.0 to Fast Ethernet Adapter`，驱动安装包为 `SR9900_SFX.EXE`。本机已经识别该适配器，无需重复安装。
+1. 从设备配套资料包取得并安装 `上位机软件/USB路由器驱动程序/windows/SR9900_SFX.EXE`，再插入厂商 USB 接收器。在设备管理器确认 `Corechip SR9900 USB2.0 to Fast Ethernet Adapter` 已正常识别。资料包与获取清单见[新电脑指南](FRESH_PC_SETUP.md#1-准备设备配套资料)。
 2. 打开 LK-Mini。设备自动连接接收器提供的 `LK-USB-Mini-EEG16` 网络，默认密码 `12345678`，设备固定 IP 为 `192.168.4.1`。
 3. 本机设备侧地址为 `192.168.4.2`，网关为 `192.168.4.254`。内置无线网卡同时连接校园网属于正常情况，不必切断校园网。
 4. 蓝灯慢闪表示已连接路由器但未连接采集软件，常亮表示已连接软件。
